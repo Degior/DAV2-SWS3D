@@ -9,7 +9,7 @@ from dataset.transform import Resize, NormalizeImage, PrepareForNet
 
 class US3D(Dataset):
 
-    def __init__(self, filelist_path, mode, size=(512, 512)):
+    def __init__(self, filelist_path, mode, size=(518, 518)):
         self.mode = mode
         self.size = size
 
