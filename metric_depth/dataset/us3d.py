@@ -68,7 +68,7 @@ class US3D(Dataset):
         sample['image'] = torch.from_numpy(sample['image']).float()
         sample['height'] = torch.from_numpy(sample['height']).float()
 
-        sample['valid_mask'] = (torch.isnan(sample['depth']) == 0)
+        sample['valid_mask'] = (torch.isnan(sample['height']) == 0)
 
         if semantics is not None:
             sample['semantics'] = torch.from_numpy(sample['semantics']).long()
