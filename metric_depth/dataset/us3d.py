@@ -10,18 +10,9 @@ from dataset.transform import Resize, NormalizeImage, PrepareForNet
 class US3D(Dataset):
 
     def __init__(self, filelist_path, mode, size=(512, 512)):
-        """
-        Args:
-            filelist_path (str): путь к .txt файлу, где каждая строка:
-                                 image_path height_map_path [semantic_path]
-            mode (str): 'train', 'val' или 'test'
-            size (tuple): (ширина, высота) — размер после resize
-        """
-        assert mode in ('train', 'val', 'test'), f"Unknown mode: {mode}"
         self.mode = mode
         self.size = size
 
-        # читаем список файлов
         with open(filelist_path, 'r') as f:
             lines = f.read().splitlines()
         self.filelist = [line.strip().split() for line in lines]
@@ -77,7 +68,7 @@ class US3D(Dataset):
         sample['image'] = torch.from_numpy(sample['image']).float()
         sample['height'] = torch.from_numpy(sample['height']).float()
 
-        sample['valid_mask'] = (sample['height'] > 0).float()
+        sample['valid_mask'] = (torch.isnan(sample['depth']) == 0)
 
         if semantics is not None:
             sample['semantics'] = torch.from_numpy(sample['semantics']).long()
