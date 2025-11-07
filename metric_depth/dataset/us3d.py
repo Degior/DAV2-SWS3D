@@ -24,7 +24,7 @@ class US3D(Dataset):
                 height=net_h,
                 resize_target=(mode == 'train'),
                 keep_aspect_ratio=True,
-                ensure_multiple_of=16,
+                ensure_multiple_of=14,
                 resize_method='lower_bound',
                 image_interpolation_method=cv2.INTER_CUBIC,
             ),
