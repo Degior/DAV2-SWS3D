@@ -59,16 +59,16 @@ class US3D(Dataset):
             if semantics is not None:
                 semantics = semantics.astype('int64')
 
-        sample = {'image': image, 'height': height_map}
+        sample = {'image': image, 'depth': height_map}
         if semantics is not None:
             sample['semantics'] = semantics
 
         sample = self.transform(sample)
 
         sample['image'] = torch.from_numpy(sample['image']).float()
-        sample['height'] = torch.from_numpy(sample['height']).float()
+        sample['depth'] = torch.from_numpy(sample['depth']).float()
 
-        sample['valid_mask'] = (torch.isnan(sample['height']) == 0)
+        sample['valid_mask'] = (torch.isnan(sample['depth']) == 0)
 
         if semantics is not None:
             sample['semantics'] = torch.from_numpy(sample['semantics']).long()
