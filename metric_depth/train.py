@@ -20,7 +20,7 @@ from dataset.vkitti2 import VKITTI2
 from depth_anything_v2.dpt import DepthAnythingV2
 from dataset.us3d import US3D
 from util.dist_helper import setup_distributed
-from util.loss import SiLogLoss
+from util.loss import HeightLoss
 from util.metric import eval_depth
 from util.utils import init_log
 
@@ -102,7 +102,7 @@ def main():
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
                                                       output_device=local_rank, find_unused_parameters=True)
 
-    criterion = SiLogLoss().cuda(local_rank)
+    criterion = HeightLoss(lambda_scale=0.1, lambda_angle=0.1).cuda(local_rank)
 
     optimizer = AdamW(
         [{'params': [param for name, param in model.named_parameters() if 'pretrained' in name], 'lr': args.lr},
@@ -131,19 +131,52 @@ def main():
         model.train()
         total_loss = 0
 
+        # for i, sample in enumerate(trainloader):
+        #     optimizer.zero_grad()
+        #
+        #     img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
+        #
+        #     # ???????????????????????
+        #     if random.random() < 0.5:
+        #         img = img.flip(-1)
+        #         depth = depth.flip(-1)
+        #         valid_mask = valid_mask.flip(-1)
+        #
+        #     pred = model(img)
+        #
+        #     loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
+        #
+        #     loss.backward()
+        #     optimizer.step()
+
         for i, sample in enumerate(trainloader):
             optimizer.zero_grad()
 
-            img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
+            img = sample['image'].cuda()
+            depth = sample['depth'].cuda()
+            valid_mask = sample['valid_mask'].cuda()
+            scale_gt = sample['scale'].cuda()
+            angle_gt = sample['angle'].cuda()
 
+            # ???????????????????????
             if random.random() < 0.5:
                 img = img.flip(-1)
                 depth = depth.flip(-1)
                 valid_mask = valid_mask.flip(-1)
 
-            pred = model(img)
+            outputs = model(img)
 
-            loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
+            # mask height predictions
+            pred = outputs["depth"]
+            pred = pred * valid_mask  # mask invalid pixels
+
+            batch_targets = {
+                "depth": depth,
+                "scale": scale_gt,
+                "angle": angle_gt
+            }
+
+            loss = criterion(outputs, batch_targets)
 
             loss.backward()
             optimizer.step()
@@ -180,7 +213,8 @@ def main():
             sample['valid_mask'].cuda()[0]
 
             with torch.no_grad():
-                pred = model(img)
+                outputs = model(img)
+                pred = outputs["depth"]
                 pred = F.interpolate(pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True)[0, 0]
 
             valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
