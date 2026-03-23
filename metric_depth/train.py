@@ -64,7 +64,7 @@ def main():
     elif args.dataset == 'vkitti':
         trainset = VKITTI2('dataset/splits/vkitti2/train.txt', 'train', size=size)
     elif args.dataset == 'us3d':
-        trainset = US3D('dataset/splits/us3d/train.txt', 'train', size=size)
+        trainset = US3DWH('dataset/splits/us3d/train.txt', 'train', size=size)
     else:
         raise NotImplementedError
     trainsampler = torch.utils.data.distributed.DistributedSampler(trainset)
@@ -76,7 +76,7 @@ def main():
     elif args.dataset == 'vkitti':
         valset = KITTI('dataset/splits/kitti/val.txt', 'val', size=size)
     elif args.dataset == 'us3d':
-        valset = US3D('dataset/splits/us3d/val.txt', 'val', size=size)
+        valset = US3DWH('dataset/splits/us3d/val.txt', 'val', size=size)
     else:
         raise NotImplementedError
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
