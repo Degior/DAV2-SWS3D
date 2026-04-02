@@ -21,14 +21,15 @@ from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
 from util.dist_helper import setup_distributed
-from util.loss import HeightLoss
+from util.loss import HeightLoss, BerHuLoss
 from util.metric import eval_depth
 from util.utils import init_log
 
 parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
 
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='hypersim', choices=['hypersim', 'vkitti', 'us3d'])
+parser.add_argument('--dataset', default='us3d', choices=['hypersim', 'vkitti', 'us3d', 'us3dwh'])
+parser.add_argument('--freeze-bacbone', default=False, type=bool)
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
 parser.add_argument('--max-depth', default=20, type=float)
@@ -64,8 +65,10 @@ def main():
         trainset = Hypersim('dataset/splits/hypersim/train.txt', 'train', size=size)
     elif args.dataset == 'vkitti':
         trainset = VKITTI2('dataset/splits/vkitti2/train.txt', 'train', size=size)
-    elif args.dataset == 'us3d':
+    elif args.dataset == 'us3dwh':
         trainset = US3DWH('dataset/splits/us3d/train.txt', 'train', size=size)
+    elif args.dataset == 'us3d':
+        trainset = US3D('dataset/splits/us3d/train.txt', 'train', size=size)
     else:
         raise NotImplementedError
     trainsampler = torch.utils.data.distributed.DistributedSampler(trainset)
@@ -76,8 +79,10 @@ def main():
         valset = Hypersim('dataset/splits/hypersim/val.txt', 'val', size=size)
     elif args.dataset == 'vkitti':
         valset = KITTI('dataset/splits/kitti/val.txt', 'val', size=size)
-    elif args.dataset == 'us3d':
+    elif args.dataset == 'us3dwh':
         valset = US3DWH('dataset/splits/us3d/val.txt', 'val', size=size)
+    elif args.dataset == 'us3d':
+        valset = US3D('dataset/splits/us3d/val.txt', 'val', size=size)
     else:
         raise NotImplementedError
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
@@ -91,7 +96,14 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-    model = DepthAnythingV2withHeads(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    if args.dataset == 'us3dwh':
+        model = DepthAnythingV2withHeads(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    elif args.dataset == 'us3d' and args.freeze_bacbone:
+        model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+        for param in model.pretrained.parameters():
+            param.requires_grad = False
+    else:
+        model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
 
     if args.pretrained_from:
         model.load_state_dict(
@@ -102,14 +114,26 @@ def main():
     model.cuda(local_rank)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
                                                       output_device=local_rank, find_unused_parameters=True)
+    if args.dataset == 'us3dwh':
+        criterion = HeightLoss(lambda_scale=0.1, lambda_angle=0.1).cuda(local_rank)
+    else:
+        criterion = BerHuLoss().cuda(local_rank)
 
-    criterion = HeightLoss(lambda_scale=0.1, lambda_angle=0.1).cuda(local_rank)
-
-    optimizer = AdamW(
-        [{'params': [param for name, param in model.named_parameters() if 'pretrained' in name], 'lr': args.lr},
-         {'params': [param for name, param in model.named_parameters() if 'pretrained' not in name],
-          'lr': args.lr * 10.0}],
-        lr=args.lr, betas=(0.9, 0.999), weight_decay=0.01)
+    if args.freeze_backbone:
+        optimizer = AdamW(
+            model.depth_head.parameters(),
+            lr=args.lr * 10.0,
+            betas=(0.9, 0.999),
+            weight_decay=0.01
+        )
+    else:
+        optimizer = AdamW(
+            [{'params': model.pretrained.parameters(), 'lr': args.lr},
+            {'params': model.depth_head.parameters(), 'lr': args.lr * 10}],
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01
+        )
 
     total_iters = args.epochs * len(trainloader)
 
@@ -131,52 +155,52 @@ def main():
 
         model.train()
         total_loss = 0
+        if args.dataset == 'us3d':
+            for i, sample in enumerate(trainloader):
+                optimizer.zero_grad()
 
-        # for i, sample in enumerate(trainloader):
-        #     optimizer.zero_grad()
-        #
-        #     img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
-        #
-        #     # ???????????????????????
-        #     if random.random() < 0.5:
-        #         img = img.flip(-1)
-        #         depth = depth.flip(-1)
-        #         valid_mask = valid_mask.flip(-1)
-        #
-        #     pred = model(img)
-        #
-        #     loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
-        #
-        #     loss.backward()
-        #     optimizer.step()
+                img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
 
-        for i, sample in enumerate(trainloader):
-            optimizer.zero_grad()
+                # ???????????????????????
+                if random.random() < 0.5:
+                    img = img.flip(-1)
+                    depth = depth.flip(-1)
+                    valid_mask = valid_mask.flip(-1)
 
-            img = sample['image'].cuda()
-            depth = sample['depth'].cuda()
-            valid_mask = sample['valid_mask'].cuda()
-            scale_gt = sample['scale'].cuda()
-            angle_gt = sample['angle'].cuda()
+                pred = model(img)
 
-            # ???????????????????????
-            if random.random() < 0.5:
-                img = img.flip(-1)
-                depth = depth.flip(-1)
-                valid_mask = valid_mask.flip(-1)
+                loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
 
-            outputs = model(img)
+                loss.backward()
+                optimizer.step()
+        else:
+            for i, sample in enumerate(trainloader):
+                optimizer.zero_grad()
 
-            batch_targets = {
-                "depth": depth,
-                "scale": scale_gt,
-                "angle": angle_gt
-            }
+                img = sample['image'].cuda()
+                depth = sample['depth'].cuda()
+                valid_mask = sample['valid_mask'].cuda()
+                scale_gt = sample['scale'].cuda()
+                angle_gt = sample['angle'].cuda()
 
-            loss = criterion(outputs, batch_targets, valid_mask)
+                # ???????????????????????
+                if random.random() < 0.5:
+                    img = img.flip(-1)
+                    depth = depth.flip(-1)
+                    valid_mask = valid_mask.flip(-1)
 
-            loss.backward()
-            optimizer.step()
+                outputs = model(img)
+
+                batch_targets = {
+                    "depth": depth,
+                    "scale": scale_gt,
+                    "angle": angle_gt
+                }
+
+                loss = criterion(outputs, batch_targets, valid_mask)
+
+                loss.backward()
+                optimizer.step()
 
             total_loss += loss.item()
 
@@ -207,14 +231,15 @@ def main():
         for i, sample in enumerate(valloader):
 
             img, depth, valid_mask = sample['image'].cuda().float(), sample['depth'].cuda()[0], \
-            sample['valid_mask'].cuda()[0]
+                sample['valid_mask'].cuda()[0]
 
             with torch.no_grad():
-                outputs = model(img)
-                pred = outputs["depth"]
+                pred = model(img)
+                if args.dataset == 'us3dwh':
+                    pred = pred["depth"]
                 pred = F.interpolate(pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True)[0, 0]
 
-            # valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
+            valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
 
             # if valid_mask.sum() < 10:
             #     continue

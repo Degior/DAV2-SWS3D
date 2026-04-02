@@ -20,10 +20,10 @@ class BerHuLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, pred, target, mask=None):
-        if mask is not None:
-            pred = pred[mask]
-            target = target[mask]
+    def forward(self, pred, target, valid_mask=None):
+        if valid_mask is not None:
+            pred = pred[valid_mask]
+            target = target[valid_mask]
 
         error = pred - target
         abs_error = torch.abs(error)
