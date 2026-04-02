@@ -5,7 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 
-from dataset.transform import Resize, NormalizeImage, PrepareForNet
+from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop
 
 
 class US3DWH(Dataset):
@@ -80,8 +80,6 @@ class US3DWH(Dataset):
 
         scale = float(meta["scale"])
         angle = float(meta["angle"])
-
-        scale = np.log(scale + 1e-6)
 
         semantics = None
         if semantic_path:

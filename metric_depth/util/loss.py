@@ -52,9 +52,10 @@ class HeightLoss(nn.Module):
         self.lambda_scale = lambda_scale
         self.lambda_angle = lambda_angle
 
-    def forward(self, outputs, target):
-        pred_h = outputs["depth"]
-        gt_h = target["depth"]
+    def forward(self, outputs, target, valid_mask):
+        valid_mask = valid_mask.detach()
+        pred_h = outputs["depth"][valid_mask]
+        gt_h = target["depth"][valid_mask]
 
         pred_scale = outputs["scale"]
         gt_scale = torch.log(target["scale"] + 1e-6)

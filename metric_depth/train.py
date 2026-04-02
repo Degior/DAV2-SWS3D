@@ -17,8 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.hypersim import Hypersim
 from dataset.kitti import KITTI
 from dataset.vkitti2 import VKITTI2
-from depth_anything_v2.dpt import DepthAnythingV2
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
 from dataset.us3d import US3D
+from dataset.us3d_with_heads import US3DWH
 from util.dist_helper import setup_distributed
 from util.loss import HeightLoss
 from util.metric import eval_depth
@@ -90,7 +91,7 @@ def main():
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-    model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+    model = DepthAnythingV2withHeads(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
 
     if args.pretrained_from:
         model.load_state_dict(
@@ -166,17 +167,13 @@ def main():
 
             outputs = model(img)
 
-            # mask height predictions
-            pred = outputs["depth"]
-            pred = pred * valid_mask  # mask invalid pixels
-
             batch_targets = {
                 "depth": depth,
                 "scale": scale_gt,
                 "angle": angle_gt
             }
 
-            loss = criterion(outputs, batch_targets)
+            loss = criterion(outputs, batch_targets, valid_mask)
 
             loss.backward()
             optimizer.step()
@@ -217,10 +214,10 @@ def main():
                 pred = outputs["depth"]
                 pred = F.interpolate(pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True)[0, 0]
 
-            valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
+            # valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
 
-            if valid_mask.sum() < 10:
-                continue
+            # if valid_mask.sum() < 10:
+            #     continue
 
             cur_results = eval_depth(pred[valid_mask], depth[valid_mask])
 
