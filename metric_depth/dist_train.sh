@@ -4,7 +4,6 @@ now=$(date +"%Y%m%d_%H%M%S")
 epoch=10
 bs=4
 gpus=1
-freeze_bacbone=true
 lr=0.000005
 encoder=vitl
 dataset=us3d # vkitti
@@ -22,6 +21,6 @@ python3 -m torch.distributed.launch \
     --node_rank=0 \
     --master_addr=localhost \
     --master_port=20596 \
-    train.py --epoch $epoch --freeze-bacbone $freeze_bacbone --encoder $encoder --bs $bs --lr $lr --save-path $save_path --dataset $dataset \
+    train.py --epoch $epoch --freeze-backbone --encoder $encoder --bs $bs --lr $lr --save-path $save_path --dataset $dataset \
     --img-size $img_size --min-depth $min_depth --max-depth $max_depth --pretrained-from $pretrained_from \
     --port 20596 2>&1 | tee -a $save_path/$now.log
