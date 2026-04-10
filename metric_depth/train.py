@@ -121,15 +121,31 @@ def main():
 
     if args.freeze_backbone:
         optimizer = AdamW(
-            model.module.depth_head.parameters(),
+            [
+                {
+                    'params': model.module.depth_head.parameters(),
+                    'lr': args.lr * 10.0,
+                    'name': 'head'
+                }
+            ],
             lr=args.lr * 10.0,
             betas=(0.9, 0.999),
             weight_decay=0.01
         )
     else:
         optimizer = AdamW(
-            [{'params': model.module.pretrained.parameters(), 'lr': args.lr},
-            {'params': model.module.depth_head.parameters(), 'lr': args.lr * 10}],
+            [
+                {
+                    'params': model.module.pretrained.parameters(),
+                    'lr': args.lr,
+                    'name': 'backbone'
+                },
+                {
+                    'params': model.module.depth_head.parameters(),
+                    'lr': args.lr * 10.0,
+                    'name': 'head'
+                }
+            ],
             lr=args.lr,
             betas=(0.9, 0.999),
             weight_decay=0.01
@@ -208,16 +224,19 @@ def main():
 
         lr = args.lr * (1 - iters / total_iters) ** 0.9
 
-        optimizer.param_groups[0]["lr"] = lr
-        optimizer.param_groups[1]["lr"] = lr * 10.0
+        for group in optimizer.param_groups:
+            if group["name"] == "backbone":
+                group["lr"] = lr
+            elif group["name"] == "head":
+                group["lr"] = lr * 10.0
 
         if rank == 0:
             writer.add_scalar('train/loss', loss.item(), iters)
 
         if rank == 0 and i % 100 == 0:
             logger.info(
-                'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader), optimizer.param_groups[0]['lr'],
-                                                                   loss.item()))
+                'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
+                                                               optimizer.param_groups[0]['lr'], loss.item()))
 
         model.eval()
 
