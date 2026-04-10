@@ -29,7 +29,7 @@ parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth
 
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
 parser.add_argument('--dataset', default='us3d', choices=['hypersim', 'vkitti', 'us3d', 'us3dwh'])
-parser.add_argument('--freeze-bacbone', default=False, type=bool)
+parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.001, type=float)
 parser.add_argument('--max-depth', default=20, type=float)
@@ -98,7 +98,7 @@ def main():
     }
     if args.dataset == 'us3dwh':
         model = DepthAnythingV2withHeads(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
-    elif args.dataset == 'us3d' and args.freeze_bacbone:
+    elif args.dataset == 'us3d' and args.freeze_backbone:
         model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
         for param in model.pretrained.parameters():
             param.requires_grad = False
@@ -121,15 +121,15 @@ def main():
 
     if args.freeze_backbone:
         optimizer = AdamW(
-            model.depth_head.parameters(),
+            model.module.depth_head.parameters(),
             lr=args.lr * 10.0,
             betas=(0.9, 0.999),
             weight_decay=0.01
         )
     else:
         optimizer = AdamW(
-            [{'params': model.pretrained.parameters(), 'lr': args.lr},
-            {'params': model.depth_head.parameters(), 'lr': args.lr * 10}],
+            [{'params': model.module.pretrained.parameters(), 'lr': args.lr},
+            {'params': model.module.depth_head.parameters(), 'lr': args.lr * 10}],
             lr=args.lr,
             betas=(0.9, 0.999),
             weight_decay=0.01
@@ -202,21 +202,21 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-            total_loss += loss.item()
+        total_loss += loss.item()
 
-            iters = epoch * len(trainloader) + i
+        iters = epoch * len(trainloader) + i
 
-            lr = args.lr * (1 - iters / total_iters) ** 0.9
+        lr = args.lr * (1 - iters / total_iters) ** 0.9
 
-            optimizer.param_groups[0]["lr"] = lr
-            optimizer.param_groups[1]["lr"] = lr * 10.0
+        optimizer.param_groups[0]["lr"] = lr
+        optimizer.param_groups[1]["lr"] = lr * 10.0
 
-            if rank == 0:
-                writer.add_scalar('train/loss', loss.item(), iters)
+        if rank == 0:
+            writer.add_scalar('train/loss', loss.item(), iters)
 
-            if rank == 0 and i % 100 == 0:
-                logger.info(
-                    'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader), optimizer.param_groups[0]['lr'],
+        if rank == 0 and i % 100 == 0:
+            logger.info(
+                'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader), optimizer.param_groups[0]['lr'],
                                                                    loss.item()))
 
         model.eval()
