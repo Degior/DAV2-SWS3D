@@ -80,7 +80,7 @@ class HeightLoss(nn.Module):
         pred_angle = outputs["angle"]
         gt_angle = target["angle"]
 
-        loss_h = r2_loss(pred_h, gt_h)
+        loss_h = r2_loss(pred_h, gt_h, target['target_mean'])
         loss_scale = F.mse_loss(pred_scale, gt_scale)
         loss_angle = F.mse_loss(pred_angle, gt_angle)
 
