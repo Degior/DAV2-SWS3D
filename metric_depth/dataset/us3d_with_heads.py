@@ -105,7 +105,7 @@ class US3DWH(Dataset):
 
         valid_mask = torch.isfinite(depth) & (depth > 0)
 
-        city_name = image_path.split('_')[0]
+        city_name = image_path.split('/')[-1].split('_')[0]
         mag_target_mean = mag_mean_by_city[city_name]
 
         output = {
