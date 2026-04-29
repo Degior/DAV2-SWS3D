@@ -21,9 +21,9 @@ from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
 from util.dist_helper import setup_distributed
-from util.loss import HeightLoss, BerHuLoss
+from util.loss import HeightLoss, BerHuLoss, MSELoss
 from util.metric import eval_depth
-from util.utils import init_log
+from util.utils import init_log, normalize_depth, depth_to_colormap
 
 parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
 
@@ -115,9 +115,9 @@ def main():
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
                                                       output_device=local_rank, find_unused_parameters=True)
     if args.dataset == 'us3dwh':
-        criterion = HeightLoss(lambda_scale=0.1, lambda_angle=0.1).cuda(local_rank)
+        criterion = HeightLoss(lambda_scale=0.5, lambda_angle=0.5).cuda(local_rank)
     else:
-        criterion = BerHuLoss().cuda(local_rank)
+        criterion = MSELoss().cuda(local_rank)
 
     if args.freeze_backbone:
         optimizer = AdamW(
@@ -189,6 +189,26 @@ def main():
 
                 loss.backward()
                 optimizer.step()
+
+                total_loss += loss.item()
+
+                iters = epoch * len(trainloader) + i
+
+                lr = args.lr * (1 - iters / total_iters) ** 0.9
+
+                for group in optimizer.param_groups:
+                    if group["name"] == "backbone":
+                        group["lr"] = lr
+                    elif group["name"] == "head":
+                        group["lr"] = lr * 10.0
+
+                if rank == 0:
+                    writer.add_scalar('train/loss', loss.item(), iters)
+
+                if rank == 0 and i % 100 == 0:
+                    logger.info(
+                        'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
+                                                                       optimizer.param_groups[0]['lr'], loss.item()))
         else:
             for i, sample in enumerate(trainloader):
                 optimizer.zero_grad()
@@ -196,6 +216,7 @@ def main():
                 img = sample['image'].cuda()
                 depth = sample['depth'].cuda()
                 valid_mask = sample['valid_mask'].cuda()
+                target_mean = sample['mag_target_mean'].cuda()
                 scale_gt = sample['scale'].cuda()
                 angle_gt = sample['angle'].cuda()
 
@@ -210,7 +231,8 @@ def main():
                 batch_targets = {
                     "depth": depth,
                     "scale": scale_gt,
-                    "angle": angle_gt
+                    "angle": angle_gt,
+                    "target_mean": target_mean,
                 }
 
                 loss = criterion(outputs, batch_targets, valid_mask)
@@ -218,25 +240,25 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-        total_loss += loss.item()
+                total_loss += loss.item()
 
-        iters = epoch * len(trainloader) + i
+                iters = epoch * len(trainloader) + i
 
-        lr = args.lr * (1 - iters / total_iters) ** 0.9
+                lr = args.lr * (1 - iters / total_iters) ** 0.9
 
-        for group in optimizer.param_groups:
-            if group["name"] == "backbone":
-                group["lr"] = lr
-            elif group["name"] == "head":
-                group["lr"] = lr * 10.0
+                for group in optimizer.param_groups:
+                    if group["name"] == "backbone":
+                        group["lr"] = lr
+                    elif group["name"] == "head":
+                        group["lr"] = lr * 10.0
 
-        if rank == 0:
-            writer.add_scalar('train/loss', loss.item(), iters)
+                if rank == 0:
+                    writer.add_scalar('train/loss', loss.item(), iters)
 
-        if rank == 0 and i % 100 == 0:
-            logger.info(
-                'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
-                                                               optimizer.param_groups[0]['lr'], loss.item()))
+                if rank == 0 and i % 100 == 0:
+                    logger.info(
+                        'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
+                                                                       optimizer.param_groups[0]['lr'], loss.item()))
 
         model.eval()
 
@@ -259,6 +281,21 @@ def main():
                 pred = F.interpolate(pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True)[0, 0]
 
             valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
+
+            if rank == 0 and i == 0:
+                img_vis = img[0].detach().cpu()
+
+                pred_vis = depth_to_colormap(pred.detach().cpu())
+                depth_vis = depth_to_colormap(depth.detach().cpu())
+
+                if pred_vis.dim() == 4:
+                    pred_vis = pred_vis[0]
+                if depth_vis.dim() == 4:
+                    depth_vis = depth_vis[0]
+
+                writer.add_image("val/image", img_vis, epoch)
+                writer.add_image("val/pred_depth_color", pred_vis, epoch)
+                writer.add_image("val/gt_depth_color", depth_vis, epoch)
 
             # if valid_mask.sum() < 10:
             #     continue
@@ -294,7 +331,7 @@ def main():
 
         if rank == 0:
             checkpoint = {
-                'model': model.state_dict(),
+                'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'previous_best': previous_best,
