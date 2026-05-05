@@ -216,7 +216,6 @@ def main():
                 img = sample['image'].cuda()
                 depth = sample['depth'].cuda()
                 valid_mask = sample['valid_mask'].cuda()
-                target_mean = sample['mag_target_mean'].cuda()
                 scale_gt = sample['scale'].cuda()
                 angle_gt = sample['angle'].cuda()
 
@@ -232,7 +231,6 @@ def main():
                     "depth": depth,
                     "scale": scale_gt,
                     "angle": angle_gt,
-                    "target_mean": target_mean,
                 }
 
                 loss = criterion(outputs, batch_targets, valid_mask)
