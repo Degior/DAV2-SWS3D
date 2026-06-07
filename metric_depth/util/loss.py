@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+
 class SiLogLoss(nn.Module):
     def __init__(self, lambd=0.5):
         super().__init__()
@@ -20,10 +21,10 @@ class BerHuLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, pred, target, mask=None):
-        if mask is not None:
-            pred = pred[mask]
-            target = target[mask]
+    def forward(self, pred, target, valid_mask=None):
+        if valid_mask is not None:
+            pred = pred[valid_mask]
+            target = target[valid_mask]
 
         error = pred - target
         abs_error = torch.abs(error)
@@ -39,12 +40,32 @@ class BerHuLoss(nn.Module):
 
         return torch.mean(loss)
 
-def r2_loss(output, target, target_mean):
+
+def r2_loss(pred, target):
     eps = 1e-8
+
+    target_mean = torch.mean(target)
+
     ss_tot = torch.sum((target - target_mean) ** 2)
-    ss_res = torch.sum((target - output) ** 2)
-    r2 = (ss_res + eps) / (ss_tot + eps)
-    return r2
+    ss_res = torch.sum((target - pred) ** 2)
+
+    loss = (ss_res + eps) / (ss_tot + eps)
+    return loss
+
+
+class MSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target, valid_mask):
+        valid_mask = valid_mask.detach()
+        pred_h = pred[valid_mask]
+        gt_h = target[valid_mask]
+
+        loss = F.mse_loss(pred_h, gt_h)
+
+        return loss
+
 
 class HeightLoss(nn.Module):
     def __init__(self, lambda_scale=0.1, lambda_angle=0.1):
@@ -52,25 +73,39 @@ class HeightLoss(nn.Module):
         self.lambda_scale = lambda_scale
         self.lambda_angle = lambda_angle
 
-    def forward(self, outputs, target, valid_mask):
+    def forward(self, pred, target, valid_mask):
         valid_mask = valid_mask.detach()
-        pred_h = outputs["depth"][valid_mask]
-        gt_h = target["depth"][valid_mask]
+        if valid_mask is not None:
+            pred = pred[valid_mask]
+            target = target[valid_mask]
+        error = pred - target
+        abs_error = torch.abs(error)
 
-        pred_scale = outputs["scale"]
+        c = 0.2 * torch.max(abs_error).item()
+
+        l1_part = abs_error <= c
+        l2_part = abs_error > c
+
+        loss = torch.zeros_like(abs_error)
+        loss[l1_part] = abs_error[l1_part]
+        loss[l2_part] = (error[l2_part] ** 2 + c ** 2) / (2 * c)
+
+        pred_scale = pred["scale"]
         gt_scale = torch.log(target["scale"] + 1e-6)
 
-        pred_angle = outputs["angle"]
+        pred_angle = pred["angle"]
         gt_angle = target["angle"]
 
-        loss_h = F.mse_loss(pred_h, gt_h)
+
+
+        loss_h = torch.mean(loss)
         loss_scale = F.mse_loss(pred_scale, gt_scale)
         loss_angle = F.mse_loss(pred_angle, gt_angle)
 
         loss = (
-            loss_h
-            + self.lambda_scale * loss_scale
-            + self.lambda_angle * loss_angle
+                loss_h
+                + self.lambda_scale * loss_scale
+                + self.lambda_angle * loss_angle
         )
 
         return loss

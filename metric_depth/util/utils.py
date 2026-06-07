@@ -2,6 +2,8 @@ import os
 import re
 import numpy as np
 import logging
+import matplotlib.cm as cm
+import torch
 
 logs = set()
 
@@ -24,3 +26,16 @@ def init_log(name, level=logging.INFO):
     ch.setFormatter(formatter)
     logger.addHandler(ch)
     return logger
+
+def normalize_depth(depth):
+    depth = depth.clone()
+    depth = depth - depth.min()
+    depth = depth / (depth.max() + 1e-8)
+    return depth
+
+def depth_to_colormap(depth):
+    depth = normalize_depth(depth)
+    depth = depth.numpy()
+    colored = cm.viridis(depth)[..., :3]  # RGB
+    colored = torch.from_numpy(colored).permute(2, 0, 1)
+    return colored

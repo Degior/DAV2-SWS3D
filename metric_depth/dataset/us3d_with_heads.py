@@ -7,6 +7,9 @@ from torchvision.transforms import Compose
 
 from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop
 
+mag_mean_by_city = {'ARG': 4.069477072669801, 'ATL': 5.453358976309836, 'JAX': 4.344437881497266,
+                    'OMA': 2.27878907341509}
+
 
 class US3DWH(Dataset):
 
@@ -22,21 +25,21 @@ class US3DWH(Dataset):
         net_w, net_h = size
 
         self.transform = Compose([
-            Resize(
-                width=net_w,
-                height=net_h,
-                resize_target=(mode == 'train'),
-                keep_aspect_ratio=True,
-                ensure_multiple_of=14,
-                resize_method='lower_bound',
-                image_interpolation_method=cv2.INTER_CUBIC,
-            ),
-            NormalizeImage(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-            PrepareForNet(),
-        ] + ([Crop(size[0])] if self.mode == 'train' else []))
+                                     Resize(
+                                         width=net_w,
+                                         height=net_h,
+                                         resize_target=(mode == 'train'),
+                                         keep_aspect_ratio=True,
+                                         ensure_multiple_of=14,
+                                         resize_method='lower_bound',
+                                         image_interpolation_method=cv2.INTER_CUBIC,
+                                     ),
+                                     NormalizeImage(
+                                         mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225]
+                                     ),
+                                     PrepareForNet(),
+                                 ] + ([Crop(size[0])] if self.mode == 'train' else []))
 
     def __len__(self):
         return len(self.filelist)
@@ -102,13 +105,17 @@ class US3DWH(Dataset):
 
         valid_mask = torch.isfinite(depth) & (depth > 0)
 
+        city_name = image_path.split('/')[-1].split('_')[0]
+        mag_target_mean = mag_mean_by_city[city_name]
+
         output = {
             'image': image,
             'depth': depth,
             'scale': scale,
             'angle': angle,
             'valid_mask': valid_mask,
-            'image_path': image_path
+            'image_path': image_path,
+            "mag_target_mean": mag_target_mean
         }
 
         if semantics is not None:
