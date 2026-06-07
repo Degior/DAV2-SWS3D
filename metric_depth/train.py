@@ -36,6 +36,11 @@ parser.add_argument('--max-depth', default=20, type=float)
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--lr', default=0.000005, type=float)
+parser.add_argument(
+    '--lr-scheduler',
+    default='constant',
+    choices=['constant', 'poly'],
+)
 parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local-rank', default=0, type=int)
@@ -117,7 +122,7 @@ def main():
     if args.dataset == 'us3dwh':
         criterion = HeightLoss(lambda_scale=0.5, lambda_angle=0.5).cuda(local_rank)
     else:
-        criterion = MSELoss().cuda(local_rank)
+        criterion = BerHuLoss().cuda(local_rank)
 
     if args.freeze_backbone:
         optimizer = AdamW(
@@ -152,6 +157,18 @@ def main():
         )
 
     total_iters = args.epochs * len(trainloader)
+
+    def update_learning_rate(cur_iter):
+        if args.lr_scheduler == 'constant':
+            return
+
+        lr = args.lr * (1 - cur_iter / total_iters) ** 0.9
+
+        for group in optimizer.param_groups:
+            if group["name"] == "backbone":
+                group["lr"] = lr
+            elif group["name"] == "head":
+                group["lr"] = lr * 10.0
 
     previous_best = {'d1': 0, 'd2': 0, 'd3': 0, 'abs_rel': 100, 'sq_rel': 100, 'rmse': 100, 'rmse_log': 100,
                      'log10': 100, 'silog': 100}
@@ -193,14 +210,7 @@ def main():
                 total_loss += loss.item()
 
                 iters = epoch * len(trainloader) + i
-
-                lr = args.lr * (1 - iters / total_iters) ** 0.9
-
-                for group in optimizer.param_groups:
-                    if group["name"] == "backbone":
-                        group["lr"] = lr
-                    elif group["name"] == "head":
-                        group["lr"] = lr * 10.0
+                update_learning_rate(iters)
 
                 if rank == 0:
                     writer.add_scalar('train/loss', loss.item(), iters)
@@ -241,14 +251,7 @@ def main():
                 total_loss += loss.item()
 
                 iters = epoch * len(trainloader) + i
-
-                lr = args.lr * (1 - iters / total_iters) ** 0.9
-
-                for group in optimizer.param_groups:
-                    if group["name"] == "backbone":
-                        group["lr"] = lr
-                    elif group["name"] == "head":
-                        group["lr"] = lr * 10.0
+                update_learning_rate(iters)
 
                 if rank == 0:
                     writer.add_scalar('train/loss', loss.item(), iters)
