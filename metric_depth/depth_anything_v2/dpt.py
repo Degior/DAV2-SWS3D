@@ -8,7 +8,6 @@ from .dinov2 import DINOv2
 from .util.blocks import FeatureFusionBlock, _make_scratch
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 
-
 def _make_fusion_block(features, use_bn, size=None):
     return FeatureFusionBlock(
         features,
@@ -224,6 +223,88 @@ class DepthAnythingV2(nn.Module):
         return image, (h, w)
 
 
+class AttnPool1D(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+
+        self.score = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim // 2),
+            nn.GELU(),
+            nn.Linear(dim // 2, 1)
+        )
+
+    def forward(self, tokens):
+        weights = self.score(tokens)
+        weights = torch.softmax(weights, dim=1)
+        return (tokens * weights).sum(dim=1)
+
+
+class MultiScaleAttnHead(nn.Module):
+    def __init__(
+            self,
+            embed_dim,
+            hidden_dim=512,
+            num_layers=4,
+            out_dim=1,
+            dropout=0.1
+    ):
+        super().__init__()
+
+        self.num_layers = num_layers
+
+        self.patch_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU()
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.cls_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, hidden_dim),
+                nn.GELU()
+            )
+            for _ in range(num_layers)
+        ])
+
+        self.attn_pool = nn.ModuleList([
+            AttnPool1D(hidden_dim)
+            for _ in range(num_layers)
+        ])
+
+        self.fuse = nn.Sequential(
+            nn.LayerNorm(hidden_dim * num_layers * 2),
+            nn.Linear(hidden_dim * num_layers * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, out_dim)
+        )
+
+    def forward(self, features):
+        pooled_features = []
+
+        for i, feat in enumerate(features):
+            patch_tokens, cls_token = feat
+
+            patch_tokens = self.patch_proj[i](patch_tokens)
+            cls_token = self.cls_proj[i](cls_token)
+
+            patch_global = self.attn_pool[i](patch_tokens)
+
+            pooled_features.append(cls_token)
+            pooled_features.append(patch_global)
+
+        global_feat = torch.cat(pooled_features, dim=-1)
+        return self.fuse(global_feat)
+
+
 class DepthAnythingV2withHeads(nn.Module):
     def __init__(
             self,
@@ -231,8 +312,10 @@ class DepthAnythingV2withHeads(nn.Module):
             features=256,
             out_channels=[256, 512, 1024, 1024],
             use_bn=False,
-            use_clstoken=True, #False?
-            max_depth=20.0
+            use_clstoken=True,
+            max_depth=20.0,
+            head_hidden_dim=512,
+            head_dropout=0.1
     ):
         super(DepthAnythingV2withHeads, self).__init__()
 
@@ -244,45 +327,62 @@ class DepthAnythingV2withHeads(nn.Module):
         }
 
         self.max_depth = max_depth
-
         self.encoder = encoder
+
         self.pretrained = DINOv2(model_name=encoder)
 
-        self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels,
-                                  use_clstoken=use_clstoken)
-
-        embed_dim = self.pretrained.embed_dim
-
-        self.scale_head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
+        self.depth_head = DPTHead(
+            self.pretrained.embed_dim,
+            features,
+            use_bn,
+            out_channels=out_channels,
+            use_clstoken=use_clstoken
         )
 
-        self.angle_head = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
+        embed_dim = self.pretrained.embed_dim
+        num_aux_layers = len(self.intermediate_layer_idx[encoder])
+
+        self.scale_head = MultiScaleAttnHead(
+            embed_dim=embed_dim,
+            hidden_dim=head_hidden_dim,
+            num_layers=num_aux_layers,
+            out_dim=1,
+            dropout=head_dropout
+        )
+
+        self.angle_head = MultiScaleAttnHead(
+            embed_dim=embed_dim,
+            hidden_dim=head_hidden_dim,
+            num_layers=num_aux_layers,
+            out_dim=2,
+            dropout=head_dropout
         )
 
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
 
         features = self.pretrained.get_intermediate_layers(
-            x, self.intermediate_layer_idx[self.encoder], return_class_token=True
+            x,
+            self.intermediate_layer_idx[self.encoder],
+            return_class_token=True
         )
 
-        cls_token = features[-1][1]
-
-        scale_pred = self.scale_head(cls_token)
-        angle_pred = self.angle_head(cls_token)
-
         depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
+        depth = depth.squeeze(1)
+
+        log_scale = self.scale_head(features).squeeze(1)
+
+        angle_vec = self.angle_head(features)
+        angle_vec = F.normalize(angle_vec, p=2, dim=-1, eps=1e-6)
+
+        angle = torch.atan2(angle_vec[:, 0], angle_vec[:, 1])
+        angle = angle % (2 * torch.pi)
 
         return {
-            "depth": depth.squeeze(1),
-            "scale": scale_pred.squeeze(1),
-            "angle": angle_pred.squeeze(1),
+            "depth": depth,
+            "scale": log_scale,
+            "angle": angle,
+            "angle_vec": angle_vec,
         }
 
     @torch.no_grad()
@@ -292,7 +392,12 @@ class DepthAnythingV2withHeads(nn.Module):
         outputs = self.forward(image)
         depth = outputs["depth"]
 
-        depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
+        depth = F.interpolate(
+            depth[:, None],
+            (h, w),
+            mode="bilinear",
+            align_corners=True
+        )[0, 0]
 
         return depth.cpu().numpy()
 
@@ -307,18 +412,27 @@ class DepthAnythingV2withHeads(nn.Module):
                 resize_method='lower_bound',
                 image_interpolation_method=cv2.INTER_CUBIC,
             ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            NormalizeImage(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
             PrepareForNet(),
         ])
 
         h, w = raw_image.shape[:2]
 
         image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
-
         image = transform({'image': image})['image']
         image = torch.from_numpy(image).unsqueeze(0)
 
-        DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        DEVICE = (
+            'cuda'
+            if torch.cuda.is_available()
+            else 'mps'
+            if torch.backends.mps.is_available()
+            else 'cpu'
+        )
+
         image = image.to(DEVICE)
 
         return image, (h, w)
