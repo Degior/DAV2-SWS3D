@@ -68,44 +68,68 @@ class MSELoss(nn.Module):
 
 
 class HeightLoss(nn.Module):
-    def __init__(self, lambda_scale=0.1, lambda_angle=0.1):
+    def __init__(
+            self,
+            lambda_scale=0.1,
+            lambda_angle=0.1,
+            depth_beta=1.0,
+            scale_beta=0.1,
+            eps=1e-6
+    ):
         super().__init__()
+
         self.lambda_scale = lambda_scale
         self.lambda_angle = lambda_angle
+        self.depth_beta = depth_beta
+        self.scale_beta = scale_beta
+        self.eps = eps
 
     def forward(self, pred, target, valid_mask):
-        valid_mask = valid_mask.detach()
+        pred_h = pred["depth"]
+        gt_h = target["depth"]
+
         if valid_mask is not None:
-            pred = pred[valid_mask]
-            target = target[valid_mask]
-        error = pred - target
-        abs_error = torch.abs(error)
+            valid_mask = valid_mask.detach().bool()
+            pred_h = pred_h[valid_mask]
+            gt_h = gt_h[valid_mask]
 
-        c = 0.2 * torch.max(abs_error).item()
-
-        l1_part = abs_error <= c
-        l2_part = abs_error > c
-
-        loss = torch.zeros_like(abs_error)
-        loss[l1_part] = abs_error[l1_part]
-        loss[l2_part] = (error[l2_part] ** 2 + c ** 2) / (2 * c)
+        loss_h = F.smooth_l1_loss(
+            pred_h,
+            gt_h,
+            beta=self.depth_beta
+        )
 
         pred_scale = pred["scale"]
-        gt_scale = torch.log(target["scale"] + 1e-6)
+        gt_scale = torch.log(target["scale"].clamp_min(self.eps))
 
-        pred_angle = pred["angle"]
+        loss_scale = F.smooth_l1_loss(
+            pred_scale,
+            gt_scale,
+            beta=self.scale_beta
+        )
+
+        pred_angle_vec = pred["angle_vec"]
+
         gt_angle = target["angle"]
+        gt_angle_vec = torch.stack([
+            torch.sin(gt_angle),
+            torch.cos(gt_angle)
+        ], dim=-1)
 
+        gt_angle_vec = F.normalize(gt_angle_vec, p=2, dim=-1, eps=self.eps)
+        pred_angle_vec = F.normalize(pred_angle_vec, p=2, dim=-1, eps=self.eps)
 
-
-        loss_h = torch.mean(loss)
-        loss_scale = F.mse_loss(pred_scale, gt_scale)
-        loss_angle = F.mse_loss(pred_angle, gt_angle)
+        loss_angle = 1.0 - F.cosine_similarity(
+            pred_angle_vec,
+            gt_angle_vec,
+            dim=-1,
+            eps=self.eps
+        ).mean()
 
         loss = (
-                loss_h
-                + self.lambda_scale * loss_scale
-                + self.lambda_angle * loss_angle
+            loss_h
+            + self.lambda_scale * loss_scale
+            + self.lambda_angle * loss_angle
         )
 
         return loss
