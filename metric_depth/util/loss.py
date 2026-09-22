@@ -18,25 +18,31 @@ class SiLogLoss(nn.Module):
 
 
 class BerHuLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, eps=1e-6):
         super().__init__()
+        self.eps = eps
 
     def forward(self, pred, target, valid_mask=None):
         if valid_mask is not None:
+            valid_mask = valid_mask.detach().bool()
             pred = pred[valid_mask]
             target = target[valid_mask]
+
+        if pred.numel() == 0:
+            # Keep the graph connected so every DDP worker can still run backward.
+            return pred.sum() * 0.0
 
         error = pred - target
         abs_error = torch.abs(error)
 
-        c = 0.2 * torch.max(abs_error).item()
+        c = (0.2 * torch.max(abs_error).detach()).clamp_min(self.eps)
 
         l1_part = abs_error <= c
         l2_part = abs_error > c
 
         loss = torch.zeros_like(abs_error)
         loss[l1_part] = abs_error[l1_part]
-        loss[l2_part] = (error[l2_part] ** 2 + c ** 2) / (2 * c)
+        loss[l2_part] = (error[l2_part] ** 2 + c.square()) / (2 * c)
 
         return torch.mean(loss)
 
@@ -62,6 +68,9 @@ class MSELoss(nn.Module):
         pred_h = pred[valid_mask]
         gt_h = target[valid_mask]
 
+        if pred_h.numel() == 0:
+            return pred_h.sum() * 0.0
+
         loss = F.mse_loss(pred_h, gt_h)
 
         return loss
@@ -84,7 +93,7 @@ class HeightLoss(nn.Module):
         self.scale_beta = scale_beta
         self.eps = eps
 
-    def forward(self, pred, target, valid_mask):
+    def forward(self, pred, target, valid_mask, return_components=False):
         pred_h = pred["depth"]
         gt_h = target["depth"]
 
@@ -93,11 +102,14 @@ class HeightLoss(nn.Module):
             pred_h = pred_h[valid_mask]
             gt_h = gt_h[valid_mask]
 
-        loss_h = F.smooth_l1_loss(
-            pred_h,
-            gt_h,
-            beta=self.depth_beta
-        )
+        if pred_h.numel() == 0:
+            loss_h = pred["depth"].sum() * 0.0
+        else:
+            loss_h = F.smooth_l1_loss(
+                pred_h,
+                gt_h,
+                beta=self.depth_beta
+            )
 
         pred_scale = pred["scale"]
         gt_scale = torch.log(target["scale"].clamp_min(self.eps))
@@ -131,5 +143,12 @@ class HeightLoss(nn.Module):
             + self.lambda_scale * loss_scale
             + self.lambda_angle * loss_angle
         )
+
+        if return_components:
+            return loss, {
+                "depth": loss_h.detach(),
+                "scale": loss_scale.detach(),
+                "angle": loss_angle.detach(),
+            }
 
         return loss

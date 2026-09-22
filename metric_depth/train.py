@@ -1,343 +1,368 @@
 import argparse
 import logging
+import math
 import os
 import pprint
 import random
 
-import warnings
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.optim import AdamW
 import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset.hypersim import Hypersim
-from dataset.kitti import KITTI
-from dataset.vkitti2 import VKITTI2
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
 from util.dist_helper import setup_distributed
-from util.loss import HeightLoss, BerHuLoss, MSELoss
-from util.metric import eval_depth
-from util.utils import init_log, normalize_depth, depth_to_colormap
+from util.loss import BerHuLoss, HeightLoss
+from util.metric import METRIC_NAMES, eval_depth
+from util.utils import depth_to_colormap, init_log
 
-parser = argparse.ArgumentParser(description='Depth Anything V2 for Metric Depth Estimation')
 
+parser = argparse.ArgumentParser(description='Depth Anything V2 for US3D height estimation')
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='us3d', choices=['hypersim', 'vkitti', 'us3d', 'us3dwh'])
+parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh'])
+parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
+parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
-parser.add_argument('--min-depth', default=0.001, type=float)
-parser.add_argument('--max-depth', default=20, type=float)
+parser.add_argument('--min-depth', default=0.0, type=float)
+parser.add_argument('--max-depth', default=250.0, type=float)
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
-parser.add_argument('--lr', default=0.000005, type=float)
-parser.add_argument(
-    '--lr-scheduler',
-    default='constant',
-    choices=['constant', 'poly'],
-)
+parser.add_argument('--num-workers', default=4, type=int)
+parser.add_argument('--lr', default=5e-6, type=float)
+parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
+parser.add_argument('--hflip-prob', default=0.5, type=float)
+parser.add_argument('--angle-unit', default='radians', choices=['radians', 'degrees'])
+parser.add_argument('--lambda-scale', default=0.05, type=float)
+parser.add_argument('--lambda-angle', default=0.05, type=float)
 parser.add_argument('--pretrained-from', type=str)
+parser.add_argument('--resume', type=str)
 parser.add_argument('--save-path', type=str, required=True)
+parser.add_argument('--seed', default=42, type=int)
 parser.add_argument('--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
+MODEL_CONFIGS = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]},
+}
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def extract_model_state(checkpoint):
+    state = checkpoint.get('model', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state, dict):
+        raise ValueError('Checkpoint does not contain a model state dict')
+    state = {
+        key.removeprefix('module.'): value
+        for key, value in state.items()
+        if torch.is_tensor(value)
+    }
+    if not state:
+        raise ValueError('Checkpoint model state dict is empty')
+    return state
+
+
+def load_pretrained_backbone(model, path, logger):
+    checkpoint = torch.load(path, map_location='cpu')
+    state = extract_model_state(checkpoint)
+    backbone_state = {key: value for key, value in state.items() if key.startswith('pretrained.')}
+    if not backbone_state:
+        raise ValueError(f'No pretrained.* weights found in {path}')
+    incompatible = model.load_state_dict(backbone_state, strict=False)
+    logger.info(
+        'Loaded %d backbone tensors from %s (%d missing, %d unexpected)',
+        len(backbone_state), path, len(incompatible.missing_keys), len(incompatible.unexpected_keys)
+    )
+
+
+def build_optimizer(model, args):
+    groups = []
+    if not args.freeze_backbone:
+        groups.append({
+            'params': list(model.pretrained.parameters()),
+            'lr': args.lr,
+            'name': 'backbone',
+        })
+    groups.append({
+        'params': list(model.depth_head.parameters()),
+        'lr': args.lr * 10.0,
+        'name': 'depth_head',
+    })
+    if args.dataset == 'us3dwh':
+        groups.append({
+            'params': list(model.scale_head.parameters()) + list(model.angle_head.parameters()),
+            'lr': args.lr * 10.0,
+            'name': 'aux_heads',
+        })
+
+    optimizer = AdamW(groups, betas=(0.9, 0.999), weight_decay=0.01)
+    optimized = {id(param) for group in optimizer.param_groups for param in group['params']}
+    missing = [name for name, param in model.named_parameters() if param.requires_grad and id(param) not in optimized]
+    if missing:
+        raise RuntimeError(f'Trainable parameters missing from optimizer: {missing[:10]}')
+    return optimizer
+
+
+def reduce_metric_dict(metric_sums, metric_counts):
+    for name in metric_sums:
+        dist.all_reduce(metric_sums[name])
+        dist.all_reduce(metric_counts[name])
+    return {
+        name: (metric_sums[name] / metric_counts[name]).item()
+        for name in metric_sums
+        if metric_counts[name].item() > 0
+    }
+
+
 def main():
     args = parser.parse_args()
-
-    warnings.simplefilter('ignore', np.RankWarning)
+    if args.pretrained_from and args.resume:
+        parser.error('--pretrained-from and --resume are mutually exclusive')
+    if not 0.0 <= args.hflip_prob <= 1.0:
+        parser.error('--hflip-prob must be between 0 and 1')
+    if args.min_depth < 0 or args.max_depth <= args.min_depth:
+        parser.error('Expected 0 <= min-depth < max-depth')
 
     logger = init_log('global', logging.INFO)
-    logger.propagate = 0
-
+    logger.propagate = False
     rank, world_size = setup_distributed(port=args.port)
+    local_rank = int(os.environ['LOCAL_RANK'])
+    device = torch.device('cuda', local_rank)
 
-    if rank == 0:
-        all_args = {**vars(args), 'ngpus': world_size}
-        logger.info('{}\n'.format(pprint.pformat(all_args)))
-        writer = SummaryWriter(args.save_path)
-
+    seed_everything(args.seed + rank)
     cudnn.enabled = True
     cudnn.benchmark = True
+    if rank == 0:
+        os.makedirs(args.save_path, exist_ok=True)
+    dist.barrier()
+
+    writer = SummaryWriter(args.save_path) if rank == 0 else None
+    if rank == 0:
+        logger.info('%s\n', pprint.pformat({**vars(args), 'ngpus': world_size}))
 
     size = (args.img_size, args.img_size)
-    if args.dataset == 'hypersim':
-        trainset = Hypersim('dataset/splits/hypersim/train.txt', 'train', size=size)
-    elif args.dataset == 'vkitti':
-        trainset = VKITTI2('dataset/splits/vkitti2/train.txt', 'train', size=size)
-    elif args.dataset == 'us3dwh':
-        trainset = US3DWH('dataset/splits/us3d/train.txt', 'train', size=size)
-    elif args.dataset == 'us3d':
-        trainset = US3D('dataset/splits/us3d/train.txt', 'train', size=size)
-    else:
-        raise NotImplementedError
-    trainsampler = torch.utils.data.distributed.DistributedSampler(trainset)
-    trainloader = DataLoader(trainset, batch_size=args.bs, pin_memory=True, num_workers=4, drop_last=True,
-                             sampler=trainsampler)
-
-    if args.dataset == 'hypersim':
-        valset = Hypersim('dataset/splits/hypersim/val.txt', 'val', size=size)
-    elif args.dataset == 'vkitti':
-        valset = KITTI('dataset/splits/kitti/val.txt', 'val', size=size)
-    elif args.dataset == 'us3dwh':
-        valset = US3DWH('dataset/splits/us3d/val.txt', 'val', size=size)
-    elif args.dataset == 'us3d':
-        valset = US3D('dataset/splits/us3d/val.txt', 'val', size=size)
-    else:
-        raise NotImplementedError
-    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
-    valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=4, drop_last=True, sampler=valsampler)
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-
-    model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-    }
+    dataset_kwargs = {'size': size}
     if args.dataset == 'us3dwh':
-        model = DepthAnythingV2withHeads(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
-    elif args.dataset == 'us3d' and args.freeze_backbone:
-        model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
-        for param in model.pretrained.parameters():
-            param.requires_grad = False
+        dataset_class = US3DWH
+        dataset_kwargs['angle_unit'] = args.angle_unit
+        if args.hflip_prob > 0 and rank == 0:
+            logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
     else:
-        model = DepthAnythingV2(**{**model_configs[args.encoder], 'max_depth': args.max_depth})
+        dataset_class = US3D
 
+    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
+    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    trainsampler = torch.utils.data.distributed.DistributedSampler(
+        trainset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+    valsampler = torch.utils.data.distributed.DistributedSampler(
+        valset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+    )
+    trainloader = DataLoader(
+        trainset, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers,
+        drop_last=True, sampler=trainsampler, persistent_workers=args.num_workers > 0,
+    )
+    valloader = DataLoader(
+        valset, batch_size=1, pin_memory=True, num_workers=args.num_workers,
+        drop_last=False, sampler=valsampler, persistent_workers=args.num_workers > 0,
+    )
+
+    model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
+    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
+
+    resume_checkpoint = None
     if args.pretrained_from:
-        model.load_state_dict(
-            {k: v for k, v in torch.load(args.pretrained_from, map_location='cpu').items() if 'pretrained' in k},
-            strict=False)
-
-    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    model.cuda(local_rank)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False,
-                                                      output_device=local_rank, find_unused_parameters=True)
-    if args.dataset == 'us3dwh':
-        criterion = HeightLoss(lambda_scale=0.5, lambda_angle=0.5).cuda(local_rank)
-    else:
-        criterion = BerHuLoss().cuda(local_rank)
+        load_pretrained_backbone(model, args.pretrained_from, logger)
+    elif args.resume:
+        resume_checkpoint = torch.load(args.resume, map_location='cpu')
+        model.load_state_dict(extract_model_state(resume_checkpoint), strict=True)
+        if rank == 0:
+            logger.info('Resumed model from %s', args.resume)
 
     if args.freeze_backbone:
-        optimizer = AdamW(
-            [
-                {
-                    'params': model.module.depth_head.parameters(),
-                    'lr': args.lr * 10.0,
-                    'name': 'head'
-                }
-            ],
-            lr=args.lr * 10.0,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
+        for param in model.pretrained.parameters():
+            param.requires_grad = False
+
+    model.to(device)
+    optimizer = build_optimizer(model, args)
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank], output_device=local_rank,
+        broadcast_buffers=False, find_unused_parameters=False,
+    )
+
+    if args.dataset == 'us3dwh':
+        criterion = HeightLoss(
+            lambda_scale=args.lambda_scale,
+            lambda_angle=args.lambda_angle,
+        ).to(device)
     else:
-        optimizer = AdamW(
-            [
-                {
-                    'params': model.module.pretrained.parameters(),
-                    'lr': args.lr,
-                    'name': 'backbone'
-                },
-                {
-                    'params': model.module.depth_head.parameters(),
-                    'lr': args.lr * 10.0,
-                    'name': 'head'
-                }
-            ],
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
+        criterion = BerHuLoss().to(device)
+
+    start_epoch = 0
+    best_rmse = math.inf
+    if resume_checkpoint is not None:
+        if 'optimizer' in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint['optimizer'])
+        start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
+        best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
 
     total_iters = args.epochs * len(trainloader)
 
     def update_learning_rate(cur_iter):
         if args.lr_scheduler == 'constant':
             return
-
-        lr = args.lr * (1 - cur_iter / total_iters) ** 0.9
-
+        lr = args.lr * (1 - cur_iter / max(total_iters, 1)) ** 0.9
         for group in optimizer.param_groups:
-            if group["name"] == "backbone":
-                group["lr"] = lr
-            elif group["name"] == "head":
-                group["lr"] = lr * 10.0
+            group['lr'] = lr if group['name'] == 'backbone' else lr * 10.0
 
-    previous_best = {'d1': 0, 'd2': 0, 'd3': 0, 'abs_rel': 100, 'sq_rel': 100, 'rmse': 100, 'rmse_log': 100,
-                     'log10': 100, 'silog': 100}
-
-    for epoch in range(args.epochs):
-        if rank == 0:
-            logger.info('===========> Epoch: {:}/{:}, d1: {:.3f}, d2: {:.3f}, d3: {:.3f}'.format(epoch, args.epochs,
-                                                                                                 previous_best['d1'],
-                                                                                                 previous_best['d2'],
-                                                                                                 previous_best['d3']))
-            logger.info('===========> Epoch: {:}/{:}, abs_rel: {:.3f}, sq_rel: {:.3f}, rmse: {:.3f}, rmse_log: {:.3f}, '
-                        'log10: {:.3f}, silog: {:.3f}'.format(
-                epoch, args.epochs, previous_best['abs_rel'], previous_best['sq_rel'], previous_best['rmse'],
-                previous_best['rmse_log'], previous_best['log10'], previous_best['silog']))
-
-        trainloader.sampler.set_epoch(epoch + 1)
-
+    for epoch in range(start_epoch, args.epochs):
+        trainsampler.set_epoch(epoch)
         model.train()
-        total_loss = 0
-        if args.dataset == 'us3d':
-            for i, sample in enumerate(trainloader):
-                optimizer.zero_grad()
+        epoch_loss = 0.0
 
-                img, depth, valid_mask = sample['image'].cuda(), sample['depth'].cuda(), sample['valid_mask'].cuda()
+        for i, sample in enumerate(trainloader):
+            optimizer.zero_grad(set_to_none=True)
+            img = sample['image'].to(device, non_blocking=True)
+            depth = sample['depth'].to(device, non_blocking=True)
+            valid_mask = sample['valid_mask'].to(device, non_blocking=True)
 
-                # ???????????????????????
-                if random.random() < 0.5:
-                    img = img.flip(-1)
-                    depth = depth.flip(-1)
-                    valid_mask = valid_mask.flip(-1)
+            if args.dataset == 'us3d' and random.random() < args.hflip_prob:
+                img = img.flip(-1)
+                depth = depth.flip(-1)
+                valid_mask = valid_mask.flip(-1)
 
-                pred = model(img)
+            outputs = model(img)
+            train_mask = (
+                valid_mask.bool() & torch.isfinite(depth)
+                & (depth >= args.min_depth) & (depth <= args.max_depth)
+            )
 
-                loss = criterion(pred, depth, (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth))
-
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-
-                iters = epoch * len(trainloader) + i
-                update_learning_rate(iters)
-
-                if rank == 0:
-                    writer.add_scalar('train/loss', loss.item(), iters)
-
-                if rank == 0 and i % 100 == 0:
-                    logger.info(
-                        'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
-                                                                       optimizer.param_groups[0]['lr'], loss.item()))
-        else:
-            for i, sample in enumerate(trainloader):
-                optimizer.zero_grad()
-
-                img = sample['image'].cuda()
-                depth = sample['depth'].cuda()
-                valid_mask = sample['valid_mask'].cuda()
-                scale_gt = sample['scale'].cuda()
-                angle_gt = sample['angle'].cuda()
-
-                # ???????????????????????
-                if random.random() < 0.5:
-                    img = img.flip(-1)
-                    depth = depth.flip(-1)
-                    valid_mask = valid_mask.flip(-1)
-
-                outputs = model(img)
-
-                batch_targets = {
-                    "depth": depth,
-                    "scale": scale_gt,
-                    "angle": angle_gt,
+            loss_parts = None
+            if args.dataset == 'us3dwh':
+                targets = {
+                    'depth': depth,
+                    'scale': sample['scale'].to(device, non_blocking=True),
+                    'angle': sample['angle'].to(device, non_blocking=True),
                 }
+                loss, loss_parts = criterion(outputs, targets, train_mask, return_components=True)
+            else:
+                loss = criterion(outputs, depth, train_mask)
 
-                loss = criterion(outputs, batch_targets, valid_mask)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
 
-                loss.backward()
-                optimizer.step()
-
-                total_loss += loss.item()
-
-                iters = epoch * len(trainloader) + i
-                update_learning_rate(iters)
-
-                if rank == 0:
-                    writer.add_scalar('train/loss', loss.item(), iters)
-
-                if rank == 0 and i % 100 == 0:
-                    logger.info(
-                        'Iter: {}/{}, LR: {:.7f}, Loss: {:.3f}'.format(i, len(trainloader),
-                                                                       optimizer.param_groups[0]['lr'], loss.item()))
+            iters = epoch * len(trainloader) + i
+            update_learning_rate(iters)
+            if writer is not None:
+                writer.add_scalar('train/loss', loss.item(), iters)
+                writer.add_scalar('train/valid_fraction', train_mask.float().mean().item(), iters)
+                if loss_parts is not None:
+                    for name, value in loss_parts.items():
+                        writer.add_scalar(f'train/loss_{name}', value.item(), iters)
+            if rank == 0 and i % 100 == 0:
+                logger.info(
+                    'Epoch %d/%d, iter %d/%d, LR %.3e, loss %.4f, valid %.1f%%',
+                    epoch + 1, args.epochs, i, len(trainloader),
+                    optimizer.param_groups[0]['lr'], loss.item(), 100 * train_mask.float().mean().item()
+                )
 
         model.eval()
-
-        results = {'d1': torch.tensor([0.0]).cuda(), 'd2': torch.tensor([0.0]).cuda(), 'd3': torch.tensor([0.0]).cuda(),
-                   'abs_rel': torch.tensor([0.0]).cuda(), 'sq_rel': torch.tensor([0.0]).cuda(),
-                   'rmse': torch.tensor([0.0]).cuda(),
-                   'rmse_log': torch.tensor([0.0]).cuda(), 'log10': torch.tensor([0.0]).cuda(),
-                   'silog': torch.tensor([0.0]).cuda()}
-        nsamples = torch.tensor([0.0]).cuda()
+        metric_names = list(METRIC_NAMES)
+        if args.dataset == 'us3dwh':
+            metric_names += ['scale_log_mae', 'angle_mae_deg']
+        metric_sums = {name: torch.zeros((), device=device) for name in metric_names}
+        metric_counts = {name: torch.zeros((), device=device) for name in metric_names}
 
         for i, sample in enumerate(valloader):
-
-            img, depth, valid_mask = sample['image'].cuda().float(), sample['depth'].cuda()[0], \
-                sample['valid_mask'].cuda()[0]
-
+            img = sample['image'].to(device, non_blocking=True).float()
+            depth = sample['depth'].to(device, non_blocking=True)[0]
+            valid_mask = sample['valid_mask'].to(device, non_blocking=True)[0]
             with torch.no_grad():
-                pred = model(img)
-                if args.dataset == 'us3dwh':
-                    pred = pred["depth"]
-                pred = F.interpolate(pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True)[0, 0]
+                outputs = model(img)
+                pred = outputs['depth'] if args.dataset == 'us3dwh' else outputs
+                pred = F.interpolate(
+                    pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True
+                )[0, 0]
 
-            valid_mask = (valid_mask == 1) & (depth >= args.min_depth) & (depth <= args.max_depth)
+            eval_mask = (
+                valid_mask.bool() & torch.isfinite(depth) & torch.isfinite(pred)
+                & (depth >= args.min_depth) & (depth <= args.max_depth)
+            )
+            current = eval_depth(pred[eval_mask], depth[eval_mask])
+            for name, value in current.items():
+                metric_sums[name] += value
+                metric_counts[name] += 1
 
-            if rank == 0 and i == 0:
-                img_vis = img[0].detach().cpu()
+            if args.dataset == 'us3dwh':
+                scale_gt = sample['scale'].to(device)
+                angle_gt = sample['angle'].to(device)
+                metric_sums['scale_log_mae'] += torch.abs(
+                    outputs['scale'] - torch.log(scale_gt.clamp_min(1e-6))
+                ).mean()
+                metric_counts['scale_log_mae'] += 1
+                angle_diff = torch.atan2(
+                    torch.sin(outputs['angle'] - angle_gt),
+                    torch.cos(outputs['angle'] - angle_gt),
+                ).abs()
+                metric_sums['angle_mae_deg'] += torch.rad2deg(angle_diff).mean()
+                metric_counts['angle_mae_deg'] += 1
 
-                pred_vis = depth_to_colormap(pred.detach().cpu())
-                depth_vis = depth_to_colormap(depth.detach().cpu())
+            if writer is not None and i == 0:
+                image_vis = img[0].detach().cpu()
+                mean = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+                std = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+                image_vis = (image_vis * std + mean).clamp(0, 1)
+                writer.add_image('val/image', image_vis, epoch)
+                writer.add_image('val/pred_height_color', depth_to_colormap(pred.detach().cpu()), epoch)
+                writer.add_image('val/gt_height_color', depth_to_colormap(depth.detach().cpu()), epoch)
 
-                if pred_vis.dim() == 4:
-                    pred_vis = pred_vis[0]
-                if depth_vis.dim() == 4:
-                    depth_vis = depth_vis[0]
-
-                writer.add_image("val/image", img_vis, epoch)
-                writer.add_image("val/pred_depth_color", pred_vis, epoch)
-                writer.add_image("val/gt_depth_color", depth_vis, epoch)
-
-            # if valid_mask.sum() < 10:
-            #     continue
-
-            cur_results = eval_depth(pred[valid_mask], depth[valid_mask])
-
-            for k in results.keys():
-                results[k] += cur_results[k]
-            nsamples += 1
-
-        torch.distributed.barrier()
-
-        for k in results.keys():
-            dist.reduce(results[k], dst=0)
-        dist.reduce(nsamples, dst=0)
-
+        averages = reduce_metric_dict(metric_sums, metric_counts)
         if rank == 0:
-            logger.info('==========================================================================================')
-            logger.info('{:>8}, {:>8}, {:>8}, {:>8}, {:>8}, {:>8}, {:>8}, {:>8}, {:>8}'.format(*tuple(results.keys())))
-            logger.info('{:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}, {:8.3f}'.format(
-                *tuple([(v / nsamples).item() for v in results.values()])))
-            logger.info('==========================================================================================')
-            print()
+            logger.info('Validation epoch %d: %s', epoch + 1, pprint.pformat(averages))
+            logger.info('Mean training loss: %.5f', epoch_loss / max(len(trainloader), 1))
+            for name, value in averages.items():
+                writer.add_scalar(f'eval/{name}', value, epoch)
 
-            for name, metric in results.items():
-                writer.add_scalar(f'eval/{name}', (metric / nsamples).item(), epoch)
-
-        for k in results.keys():
-            if k in ['d1', 'd2', 'd3']:
-                previous_best[k] = max(previous_best[k], (results[k] / nsamples).item())
-            else:
-                previous_best[k] = min(previous_best[k], (results[k] / nsamples).item())
-
-        if rank == 0:
             checkpoint = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
-                'previous_best': previous_best,
+                'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
+                'args': vars(args),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+            if averages.get('rmse', math.inf) < best_rmse:
+                best_rmse = averages['rmse']
+                checkpoint['best_rmse'] = best_rmse
+                torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+                logger.info('New best RMSE: %.4f', best_rmse)
+
+        best_tensor = torch.tensor(best_rmse, device=device)
+        dist.broadcast(best_tensor, src=0)
+        best_rmse = best_tensor.item()
+
+    if writer is not None:
+        writer.close()
+    dist.destroy_process_group()
 
 
 if __name__ == '__main__':

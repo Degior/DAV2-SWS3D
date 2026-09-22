@@ -15,7 +15,16 @@ class US3D(Dataset):
 
         with open(filelist_path, 'r') as f:
             lines = f.read().splitlines()
-        self.filelist = [line.strip().split() for line in lines]
+        self.filelist = [
+            line.strip().split()
+            for line in lines
+            if line.strip() and not line.lstrip().startswith('#')
+        ]
+        invalid = [record for record in self.filelist if len(record) not in {2, 3}]
+        if invalid:
+            raise ValueError(f"Unexpected US3D split record: {invalid[0]}")
+        if not self.filelist:
+            raise ValueError(f"US3D split is empty: {filelist_path}")
 
         net_w, net_h = size
         self.transform = Compose([
@@ -54,6 +63,11 @@ class US3D(Dataset):
         height_map = cv2.imread(height_path, cv2.IMREAD_UNCHANGED)
         if height_map is None:
             raise FileNotFoundError(f"Height map not found: {height_path}")
+        if height_map.ndim != 2 or height_map.shape != image.shape[:2]:
+            raise ValueError(
+                f"Height map must be single-channel and match the image: "
+                f"image={image.shape[:2]}, height={height_map.shape}"
+            )
 
         height_map = height_map.astype('float32')
         height_map[height_map == 65535] = np.nan
@@ -64,22 +78,30 @@ class US3D(Dataset):
         semantics = None
         if semantic_path:
             semantics = cv2.imread(semantic_path, cv2.IMREAD_UNCHANGED)
-            if semantics is not None:
-                semantics = semantics.astype('int64')
+            if semantics is None:
+                raise FileNotFoundError(f"Semantic map not found: {semantic_path}")
+            if semantics.ndim != 2 or semantics.shape != image.shape[:2]:
+                raise ValueError(
+                    f"Semantic map must be single-channel and match the image: "
+                    f"image={image.shape[:2]}, semantics={semantics.shape}"
+                )
+            semantics = semantics.astype('int64')
 
         sample = {'image': image, 'depth': height_map}
         if semantics is not None:
-            sample['semantics'] = semantics
+            sample['semseg_mask'] = semantics
 
         sample = self.transform(sample)
 
         sample['image'] = torch.from_numpy(sample['image']).float()
         sample['depth'] = torch.from_numpy(sample['depth']).float()
 
-        sample['valid_mask'] = torch.isfinite(sample['depth']) & (sample['depth'] > 0)
+        # Zero is a valid background height for object-height maps. Invalid
+        # pixels are represented by the source nodata value and converted to NaN.
+        sample['valid_mask'] = torch.isfinite(sample['depth']) & (sample['depth'] >= 0)
 
         if semantics is not None:
-            sample['semantics'] = torch.from_numpy(sample['semantics']).long()
+            sample['semantics'] = torch.from_numpy(sample.pop('semseg_mask')).long()
 
         sample['image_path'] = image_path
 

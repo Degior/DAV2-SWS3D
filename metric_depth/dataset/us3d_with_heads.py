@@ -1,5 +1,6 @@
 import cv2
 import json
+import math
 import torch
 import numpy as np
 from torch.utils.data import Dataset
@@ -7,20 +8,28 @@ from torchvision.transforms import Compose
 
 from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop
 
-mag_mean_by_city = {'ARG': 4.069477072669801, 'ATL': 5.453358976309836, 'JAX': 4.344437881497266,
-                    'OMA': 2.27878907341509}
-
-
 class US3DWH(Dataset):
 
-    def __init__(self, filelist_path, mode, size=(518, 518)):
+    def __init__(self, filelist_path, mode, size=(518, 518), angle_unit='radians'):
         self.mode = mode
         self.size = size
+        if angle_unit not in {'radians', 'degrees'}:
+            raise ValueError(f"Unsupported angle unit: {angle_unit}")
+        self.angle_unit = angle_unit
 
         with open(filelist_path, 'r') as f:
             lines = f.read().splitlines()
 
-        self.filelist = [line.strip().split() for line in lines]
+        self.filelist = [
+            line.strip().split()
+            for line in lines
+            if line.strip() and not line.lstrip().startswith('#')
+        ]
+        invalid = [record for record in self.filelist if len(record) not in {3, 4}]
+        if invalid:
+            raise ValueError(f"Unexpected US3DWH split record: {invalid[0]}")
+        if not self.filelist:
+            raise ValueError(f"US3DWH split is empty: {filelist_path}")
 
         net_w, net_h = size
 
@@ -70,6 +79,11 @@ class US3DWH(Dataset):
         height_map = cv2.imread(height_path, cv2.IMREAD_UNCHANGED)
         if height_map is None:
             raise FileNotFoundError(f"Height map not found: {height_path}")
+        if height_map.ndim != 2 or height_map.shape != image.shape[:2]:
+            raise ValueError(
+                f"Height map must be single-channel and match the image: "
+                f"image={image.shape[:2]}, height={height_map.shape}"
+            )
 
         height_map = height_map.astype('float32')
         height_map[height_map == 65535] = np.nan
@@ -83,17 +97,32 @@ class US3DWH(Dataset):
 
         scale = float(meta["scale"])
         angle = float(meta["angle"])
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError(f"Scale must be finite and positive in {json_path}: {scale}")
+        if not math.isfinite(angle):
+            raise ValueError(f"Angle must be finite in {json_path}: {angle}")
+        if self.angle_unit == 'degrees':
+            angle = math.radians(angle)
+        angle %= 2 * math.pi
 
         semantics = None
         if semantic_path:
             semantics = cv2.imread(semantic_path, cv2.IMREAD_UNCHANGED)
-            if semantics is not None:
-                semantics = semantics.astype('int64')
+            if semantics is None:
+                raise FileNotFoundError(f"Semantic map not found: {semantic_path}")
+            if semantics.ndim != 2 or semantics.shape != image.shape[:2]:
+                raise ValueError(
+                    f"Semantic map must be single-channel and match the image: "
+                    f"image={image.shape[:2]}, semantics={semantics.shape}"
+                )
+            semantics = semantics.astype('int64')
 
         sample = {
             'image': image,
             'depth': height_map
         }
+        if semantics is not None:
+            sample['semseg_mask'] = semantics
 
         sample = self.transform(sample)
 
@@ -103,10 +132,7 @@ class US3DWH(Dataset):
         scale = torch.tensor(scale).float()
         angle = torch.tensor(angle).float()
 
-        valid_mask = torch.isfinite(depth) & (depth > 0)
-
-        city_name = image_path.split('/')[-1].split('_')[0]
-        mag_target_mean = mag_mean_by_city[city_name]
+        valid_mask = torch.isfinite(depth) & (depth >= 0)
 
         output = {
             'image': image,
@@ -115,10 +141,9 @@ class US3DWH(Dataset):
             'angle': angle,
             'valid_mask': valid_mask,
             'image_path': image_path,
-            "mag_target_mean": mag_target_mean
         }
 
         if semantics is not None:
-            output['semantics'] = torch.from_numpy(semantics).long()
+            output['semantics'] = torch.from_numpy(sample['semseg_mask']).long()
 
         return output

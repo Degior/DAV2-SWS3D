@@ -29,8 +29,14 @@ def init_log(name, level=logging.INFO):
 
 def normalize_depth(depth):
     depth = depth.clone()
-    depth = depth - depth.min()
-    depth = depth / (depth.max() + 1e-8)
+    valid = torch.isfinite(depth)
+    if not valid.any():
+        return torch.zeros_like(depth)
+
+    min_value = depth[valid].min()
+    max_value = depth[valid].max()
+    depth = (depth - min_value) / (max_value - min_value + 1e-8)
+    depth[~valid] = 0
     return depth
 
 def depth_to_colormap(depth):

@@ -7,19 +7,19 @@ epochs=50
 bs=4
 gpus=1
 lr=0.0000005
-lr_scheduler=constant  # constant или poly
+lr_scheduler=constant
 encoder=vitl
-dataset=us3d # vkitti
+dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
-min_depth=0.001
-max_depth=250 # 80 for virtual kitti
+min_depth=0
+max_depth=250
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_berhu_1 # exp/vkitti
+save_path=exp/us3d_berhu_1
 port=20596
 
 mkdir -p $save_path
 
-python3 -m torch.distributed.launch \
+torchrun \
     --nproc_per_node=$gpus \
     --nnodes 1 \
     --node_rank=0 \
@@ -37,5 +37,4 @@ python3 -m torch.distributed.launch \
     --min-depth $min_depth \
     --max-depth $max_depth \
     --pretrained-from $pretrained_from \
-    --port $port \
     2>&1 | tee -a $save_path/$now.log
