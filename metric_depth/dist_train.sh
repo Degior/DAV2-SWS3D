@@ -16,6 +16,7 @@ max_depth=250
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
 save_path=exp/us3d_berhu_1
 port=20596
+m4heights_train_split=/data/m4heights/splits/train.json
 
 mkdir -p $save_path
 
@@ -37,4 +38,5 @@ torchrun \
     --min-depth $min_depth \
     --max-depth $max_depth \
     --pretrained-from $pretrained_from \
+    --m4heights-train-split "$m4heights_train_split" \
     2>&1 | tee -a $save_path/$now.log
