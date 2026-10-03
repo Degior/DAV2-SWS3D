@@ -64,6 +64,14 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def freeze_structurally_unused_parameters(model):
+    # DINO's mask token is only used for masked pretraining. DPT refinenet4 is
+    # called without a skip tensor, so its first residual unit is also unused.
+    model.pretrained.mask_token.requires_grad_(False)
+    for param in model.depth_head.scratch.refinenet4.resConfUnit1.parameters():
+        param.requires_grad = False
+
+
 def extract_model_state(checkpoint):
     state = checkpoint.get('model', checkpoint) if isinstance(checkpoint, dict) else checkpoint
     if not isinstance(state, dict):
@@ -195,6 +203,7 @@ def main():
         if rank == 0:
             logger.info('Resumed model from %s', args.resume)
 
+    freeze_structurally_unused_parameters(model)
     if args.freeze_backbone:
         for param in model.pretrained.parameters():
             param.requires_grad = False
