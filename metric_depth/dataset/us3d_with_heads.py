@@ -25,7 +25,7 @@ class US3DWH(Dataset):
             for line in lines
             if line.strip() and not line.lstrip().startswith('#')
         ]
-        invalid = [record for record in self.filelist if len(record) not in {3, 4}]
+        invalid = [record for record in self.filelist if len(record) != 3]
         if invalid:
             raise ValueError(f"Unexpected US3DWH split record: {invalid[0]}")
         if not self.filelist:
@@ -59,16 +59,7 @@ class US3DWH(Dataset):
         image_path = rec[0]
         height_path = rec[1]
 
-        semantic_path = None
-        json_path = None
-
-        if len(rec) == 3:
-            json_path = rec[2]
-        elif len(rec) == 4:
-            semantic_path = rec[2]
-            json_path = rec[3]
-        else:
-            raise ValueError(f"Unexpected filelist format: {rec}")
+        json_path = rec[2]
 
         image = cv2.imread(image_path)
         if image is None:
@@ -89,9 +80,6 @@ class US3DWH(Dataset):
         height_map[height_map == 65535] = np.nan
         height_map = height_map * 0.01
 
-        if json_path is None:
-            raise ValueError("JSON path required for scale/angle")
-
         with open(json_path, 'r') as f:
             meta = json.load(f)
 
@@ -105,25 +93,10 @@ class US3DWH(Dataset):
             angle = math.radians(angle)
         angle %= 2 * math.pi
 
-        semantics = None
-        if semantic_path:
-            semantics = cv2.imread(semantic_path, cv2.IMREAD_UNCHANGED)
-            if semantics is None:
-                raise FileNotFoundError(f"Semantic map not found: {semantic_path}")
-            if semantics.ndim != 2 or semantics.shape != image.shape[:2]:
-                raise ValueError(
-                    f"Semantic map must be single-channel and match the image: "
-                    f"image={image.shape[:2]}, semantics={semantics.shape}"
-                )
-            semantics = semantics.astype('int64')
-
         sample = {
             'image': image,
             'depth': height_map
         }
-        if semantics is not None:
-            sample['semseg_mask'] = semantics
-
         sample = self.transform(sample)
 
         image = torch.from_numpy(sample['image']).float()
@@ -142,8 +115,5 @@ class US3DWH(Dataset):
             'valid_mask': valid_mask,
             'image_path': image_path,
         }
-
-        if semantics is not None:
-            output['semantics'] = torch.from_numpy(sample['semseg_mask']).long()
 
         return output

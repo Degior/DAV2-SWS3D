@@ -150,7 +150,7 @@ def main():
     cudnn.benchmark = True
     if rank == 0:
         os.makedirs(args.save_path, exist_ok=True)
-    dist.barrier()
+    dist.barrier(device_ids=[local_rank])
 
     writer = SummaryWriter(args.save_path) if rank == 0 else None
     if rank == 0:

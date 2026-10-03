@@ -15,16 +15,18 @@ class US3D(Dataset):
 
         with open(filelist_path, 'r') as f:
             lines = f.read().splitlines()
-        self.filelist = [
-            line.strip().split()
+        records = [
+            line.strip().split(maxsplit=2)
             for line in lines
             if line.strip() and not line.lstrip().startswith('#')
         ]
-        invalid = [record for record in self.filelist if len(record) not in {2, 3}]
+        invalid = [record for record in records if len(record) < 2]
         if invalid:
             raise ValueError(f"Unexpected US3D split record: {invalid[0]}")
-        if not self.filelist:
+        if not records:
             raise ValueError(f"US3D split is empty: {filelist_path}")
+        # Baseline mode permanently discards every column after RGB and AGL.
+        self.filelist = [record[:2] for record in records]
 
         net_w, net_h = size
         self.transform = Compose([
@@ -53,8 +55,6 @@ class US3D(Dataset):
         rec = self.filelist[idx]
         image_path = rec[0]
         height_path = rec[1]
-        semantic_path = rec[2] if len(rec) > 2 else None
-
         image = cv2.imread(image_path)
         if image is None:
             raise FileNotFoundError(f"Image not found: {image_path}")
@@ -75,21 +75,7 @@ class US3D(Dataset):
 
         # height_map = self.transform_height(height_map)
 
-        semantics = None
-        if semantic_path:
-            semantics = cv2.imread(semantic_path, cv2.IMREAD_UNCHANGED)
-            if semantics is None:
-                raise FileNotFoundError(f"Semantic map not found: {semantic_path}")
-            if semantics.ndim != 2 or semantics.shape != image.shape[:2]:
-                raise ValueError(
-                    f"Semantic map must be single-channel and match the image: "
-                    f"image={image.shape[:2]}, semantics={semantics.shape}"
-                )
-            semantics = semantics.astype('int64')
-
         sample = {'image': image, 'depth': height_map}
-        if semantics is not None:
-            sample['semseg_mask'] = semantics
 
         sample = self.transform(sample)
 
@@ -99,9 +85,6 @@ class US3D(Dataset):
         # Zero is a valid background height for object-height maps. Invalid
         # pixels are represented by the source nodata value and converted to NaN.
         sample['valid_mask'] = torch.isfinite(sample['depth']) & (sample['depth'] >= 0)
-
-        if semantics is not None:
-            sample['semantics'] = torch.from_numpy(sample.pop('semseg_mask')).long()
 
         sample['image_path'] = image_path
 
