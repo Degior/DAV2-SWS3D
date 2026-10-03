@@ -55,10 +55,65 @@ def colorize_height(height, min_height, max_height, cmap, grayscale):
     return (cmap(image)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
 
 
+def tile_starts(length, tile_size, step):
+    if length <= tile_size:
+        return [0]
+    starts = list(range(0, length - tile_size + 1, step))
+    if starts[-1] != length - tile_size:
+        starts.append(length - tile_size)
+    return starts
+
+
+def infer_image_tiled(model, raw_image, tile_size=518, overlap=126):
+    """Predict at source resolution and blend overlapping square tiles."""
+    if tile_size < 14 or tile_size % 14:
+        raise ValueError('tile_size must be a positive multiple of 14')
+    if not 0 <= overlap < tile_size:
+        raise ValueError('overlap must be between 0 and tile_size - 1')
+
+    height, width = raw_image.shape[:2]
+    pad_height = max(0, tile_size - height)
+    pad_width = max(0, tile_size - width)
+    if pad_height or pad_width:
+        raw_image = np.pad(
+            raw_image,
+            ((0, pad_height), (0, pad_width), (0, 0)),
+            mode='edge',
+        )
+
+    padded_height, padded_width = raw_image.shape[:2]
+    step = tile_size - overlap
+    ys = tile_starts(padded_height, tile_size, step)
+    xs = tile_starts(padded_width, tile_size, step)
+    print(f'Tiled inference: {len(ys)} x {len(xs)} = {len(ys) * len(xs)} tiles')
+
+    # Positive edge weights avoid uncovered pixels at the image boundary.
+    taper = 0.05 + 0.95 * np.hanning(tile_size).astype(np.float32)
+    weights = np.outer(taper, taper)
+    height_sum = np.zeros((padded_height, padded_width), dtype=np.float32)
+    weight_sum = np.zeros_like(height_sum)
+
+    for y in ys:
+        for x in xs:
+            tile = raw_image[y:y + tile_size, x:x + tile_size]
+            prediction = model.infer_image(tile, tile_size)
+            if prediction.shape != (tile_size, tile_size):
+                raise ValueError(f'Unexpected tile prediction shape: {prediction.shape}')
+            height_sum[y:y + tile_size, x:x + tile_size] += prediction * weights
+            weight_sum[y:y + tile_size, x:x + tile_size] += weights
+
+    return (height_sum / weight_sum)[:height, :width]
+
+
 def main():
     parser = argparse.ArgumentParser(description='Depth Anything V2 US3D height estimation')
     parser.add_argument('--img-path', required=True)
-    parser.add_argument('--input-size', type=int, default=518)
+    parser.add_argument('--input-size', type=int, default=518,
+                        help='tile size in pixels (multiple of 14); 518 by default')
+    parser.add_argument('--tile-overlap', type=int, default=126,
+                        help='overlap between adjacent tiles in pixels')
+    parser.add_argument('--resize-whole-image', action='store_true',
+                        help='use the previous whole-image resizing method')
     parser.add_argument('--outdir', default='./vis_height')
     parser.add_argument('--encoder', default='vitl', choices=list(MODEL_CONFIGS))
     parser.add_argument('--load-from', required=True)
@@ -69,6 +124,11 @@ def main():
     parser.add_argument('--pred-only', action='store_true')
     parser.add_argument('--grayscale', action='store_true')
     args = parser.parse_args()
+    if not args.resize_whole_image:
+        if args.input_size < 14 or args.input_size % 14:
+            parser.error('--input-size must be a positive multiple of 14 for tiled inference')
+        if not 0 <= args.tile_overlap < args.input_size:
+            parser.error('--tile-overlap must be between 0 and --input-size - 1')
 
     device = torch.device(
         'cuda' if torch.cuda.is_available()
@@ -97,7 +157,10 @@ def main():
             print(f'Skipping unreadable image: {filename}')
             continue
 
-        height = model.infer_image(raw_image, args.input_size)
+        if args.resize_whole_image:
+            height = model.infer_image(raw_image, args.input_size)
+        else:
+            height = infer_image_tiled(model, raw_image, args.input_size, args.tile_overlap)
         stem = os.path.splitext(os.path.basename(filename))[0]
         if args.save_numpy:
             np.save(os.path.join(args.outdir, f'{stem}_height_meter.npy'), height)
