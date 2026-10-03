@@ -11,7 +11,7 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset.us3d import US3D
@@ -23,11 +23,14 @@ from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
 
 
-parser = argparse.ArgumentParser(description='Depth Anything V2 for US3D height estimation')
+parser = argparse.ArgumentParser(description='Depth Anything V2 for overhead height estimation')
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh'])
+parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh', 'm4heights'])
 parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
+parser.add_argument('--m4heights-train-split', help='Add M4Heights manifest to US3D training')
+parser.add_argument('--m4heights-val-split', help='Also add M4Heights manifest to US3D validation')
+parser.add_argument('--m4heights-height-scale', default=1.0, type=float, help='Multiplier to metres; M4Heights default is 1')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.0, type=float)
@@ -138,6 +141,29 @@ def reduce_metric_dict(metric_sums, metric_counts):
     }
 
 
+def build_datasets(args, size):
+    dataset_kwargs = {'size': size}
+    if args.dataset == 'us3dwh':
+        dataset_class = US3DWH
+        dataset_kwargs['angle_unit'] = args.angle_unit
+    elif args.dataset == 'm4heights':
+        from dataset.m4heights import M4Heights
+        dataset_class = M4Heights
+        dataset_kwargs['height_scale'] = args.m4heights_height_scale
+    else:
+        dataset_class = US3D
+    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
+    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    if args.m4heights_train_split or args.m4heights_val_split:
+        from dataset.m4heights import M4Heights
+        m4_kwargs = {'size': size, 'height_scale': args.m4heights_height_scale}
+        if args.m4heights_train_split:
+            trainset = ConcatDataset([trainset, M4Heights(args.m4heights_train_split, 'train', **m4_kwargs)])
+        if args.m4heights_val_split:
+            valset = ConcatDataset([valset, M4Heights(args.m4heights_val_split, 'val', **m4_kwargs)])
+    return trainset, valset
+
+
 def main():
     args = parser.parse_args()
     if args.pretrained_from and args.resume:
@@ -146,6 +172,10 @@ def main():
         parser.error('--hflip-prob must be between 0 and 1')
     if args.min_depth < 0 or args.max_depth <= args.min_depth:
         parser.error('Expected 0 <= min-depth < max-depth')
+    if not math.isfinite(args.m4heights_height_scale) or args.m4heights_height_scale <= 0:
+        parser.error('--m4heights-height-scale must be finite and positive')
+    if (args.m4heights_train_split or args.m4heights_val_split) and args.dataset != 'us3d':
+        parser.error('Additional M4Heights manifests require --dataset us3d (height-only training)')
 
     logger = init_log('global', logging.INFO)
     logger.propagate = False
@@ -165,17 +195,11 @@ def main():
         logger.info('%s\n', pprint.pformat({**vars(args), 'ngpus': world_size}))
 
     size = (args.img_size, args.img_size)
-    dataset_kwargs = {'size': size}
-    if args.dataset == 'us3dwh':
-        dataset_class = US3DWH
-        dataset_kwargs['angle_unit'] = args.angle_unit
-        if args.hflip_prob > 0 and rank == 0:
-            logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
-    else:
-        dataset_class = US3D
-
-    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
-    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    if args.dataset == 'us3dwh' and args.hflip_prob > 0 and rank == 0:
+        logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
+    trainset, valset = build_datasets(args, size)
+    if rank == 0:
+        logger.info('Dataset sizes: %d train / %d val', len(trainset), len(valset))
     trainsampler = torch.utils.data.distributed.DistributedSampler(
         trainset, num_replicas=world_size, rank=rank, shuffle=True
     )
@@ -251,7 +275,7 @@ def main():
             depth = sample['depth'].to(device, non_blocking=True)
             valid_mask = sample['valid_mask'].to(device, non_blocking=True)
 
-            if args.dataset == 'us3d' and random.random() < args.hflip_prob:
+            if args.dataset != 'us3dwh' and random.random() < args.hflip_prob:
                 img = img.flip(-1)
                 depth = depth.flip(-1)
                 valid_mask = valid_mask.flip(-1)
