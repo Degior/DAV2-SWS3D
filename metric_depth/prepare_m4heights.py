@@ -84,11 +84,15 @@ def prepare_manifests(root, shards, val_fraction=0.1, seed=42, group_size=100, v
         if 'fname' not in (reader.fieldnames or []):
             raise ValueError(f'Expected fname column in {METADATA_FILE}')
         known = {Path(row['fname']).name for row in reader}
-    missing_labels = images.keys() - labels.keys()
     unknown = images.keys() - known
-    if missing_labels or unknown:
-        raise ValueError(f'Unpaired or unlisted ORTHO tiles: missing labels={sorted(missing_labels)[:5]}, '
-                         f'absent from train metadata={sorted(unknown)[:5]}')
+    if unknown:
+        print(f'Skipping {len(unknown)} ORTHO tiles absent from train metadata: {sorted(unknown)[:5]}')
+        images = {name: reference for name, reference in images.items() if name in known}
+    if not images:
+        raise ValueError('No selected ORTHO tiles are listed in train metadata')
+    missing_labels = images.keys() - labels.keys()
+    if missing_labels:
+        raise ValueError(f'Training tiles listed in metadata have missing labels: {sorted(missing_labels)[:5]}')
     samples = [{'id': name, 'image': images[name], 'height': labels[name]} for name in sorted(images)]
     train, val = split_samples(samples, val_fraction, seed, group_size, val_countries)
     split_dir = root / 'splits'
