@@ -13,10 +13,12 @@ dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
 min_depth=0
 max_depth=250
+height_activation=softplus
+initial_height=1.0
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_berhu_1
+save_path=exp/us3d_m4heights_softplus
 port=20596
-m4heights_train_split=/data/m4heights/splits/train.json
+m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-/misc/home6/s0032/DAV2-SWS3D/metric_depth/dataset/m4heights/splits/train.json}
 
 mkdir -p $save_path
 
@@ -37,6 +39,8 @@ torchrun \
     --img-size $img_size \
     --min-depth $min_depth \
     --max-depth $max_depth \
+    --height-activation $height_activation \
+    --initial-height $initial_height \
     --pretrained-from $pretrained_from \
     --m4heights-train-split "$m4heights_train_split" \
     2>&1 | tee -a $save_path/$now.log

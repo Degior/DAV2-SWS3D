@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from util.dist_helper import setup_distributed
 from util.loss import BerHuLoss, HeightLoss
 from util.metric import METRIC_NAMES, eval_depth
@@ -35,6 +35,10 @@ parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.0, type=float)
 parser.add_argument('--max-depth', default=250.0, type=float)
+parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
+                    help='Fresh training defaults to softplus in metres; resume uses checkpoint mode')
+parser.add_argument('--initial-height', default=1.0, type=float,
+                    help='Initial prediction in metres for a fresh height head (ignored on resume)')
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--num-workers', default=4, type=int)
@@ -130,6 +134,30 @@ def build_optimizer(model, args):
     return optimizer
 
 
+@torch.no_grad()
+def initialize_height_output(model, initial_height):
+    # Start near the ground rather than ~max_depth/2. Zeroing only the final
+    # convolution keeps the randomly initialized decoder and pretrained DINO.
+    output = model.depth_head.scratch.output_conv2[2]
+    output.weight.zero_()
+    if model.height_activation == 'softplus':
+        bias = initial_height + math.log(-math.expm1(-initial_height))
+    else:
+        bias = math.log(initial_height / (model.max_depth - initial_height))
+    output.bias.fill_(bias)
+
+
+def height_diagnostics(pred, target):
+    if pred.numel() == 0:
+        return {}
+    return {
+        'pred_mean': pred.mean(),
+        'gt_mean': target.mean(),
+        'pred_near_zero_fraction': (pred < 0.01).float().mean(),
+        'gt_zero_fraction': (target == 0).float().mean(),
+    }
+
+
 def reduce_metric_dict(metric_sums, metric_counts):
     for name in metric_sums:
         dist.all_reduce(metric_sums[name])
@@ -176,6 +204,19 @@ def main():
         parser.error('--m4heights-height-scale must be finite and positive')
     if (args.m4heights_train_split or args.m4heights_val_split) and args.dataset != 'us3d':
         parser.error('Additional M4Heights manifests require --dataset us3d (height-only training)')
+    resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
+    if resume_checkpoint is not None:
+        saved_activation = checkpoint_height_activation(resume_checkpoint)
+        if args.height_activation is not None and args.height_activation != saved_activation:
+            parser.error('--height-activation must match the resumed checkpoint')
+        saved_args = resume_checkpoint.get('args', {})
+        if 'max_depth' in saved_args and args.max_depth != saved_args['max_depth']:
+            parser.error('--max-depth must match the resumed checkpoint')
+        args.height_activation = saved_activation
+    else:
+        args.height_activation = args.height_activation or 'softplus'
+        if not math.isfinite(args.initial_height) or not 0 < args.initial_height < args.max_depth:
+            parser.error('--initial-height must be finite and between 0 and max-depth')
 
     logger = init_log('global', logging.INFO)
     logger.propagate = False
@@ -216,16 +257,19 @@ def main():
     )
 
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
-    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
+    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
+                           'height_activation': args.height_activation})
 
-    resume_checkpoint = None
     if args.pretrained_from:
         load_pretrained_backbone(model, args.pretrained_from, logger)
-    elif args.resume:
-        resume_checkpoint = torch.load(args.resume, map_location='cpu')
+    if resume_checkpoint is not None:
         model.load_state_dict(extract_model_state(resume_checkpoint), strict=True)
         if rank == 0:
             logger.info('Resumed model from %s', args.resume)
+    else:
+        initialize_height_output(model, args.initial_height)
+        if rank == 0:
+            logger.info('Initialized %s height output at %.3f m', args.height_activation, args.initial_height)
 
     freeze_structurally_unused_parameters(model)
     if args.freeze_backbone:
@@ -317,9 +361,16 @@ def main():
                     epoch + 1, args.epochs, i, len(trainloader),
                     optimizer.param_groups[0]['lr'], loss.item(), 100 * train_mask.float().mean().item()
                 )
+                pred = outputs['depth'] if args.dataset == 'us3dwh' else outputs
+                with torch.no_grad():
+                    diagnostics = height_diagnostics(pred[train_mask], depth[train_mask])
+                logger.info('Height diagnostics (m): %s', {name: value.item() for name, value in diagnostics.items()})
+                for name, value in diagnostics.items():
+                    writer.add_scalar(f'train/{name}', value.item(), iters)
 
         model.eval()
         metric_names = list(METRIC_NAMES)
+        metric_names += ['pred_mean', 'gt_mean', 'pred_near_zero_fraction', 'gt_zero_fraction']
         if args.dataset == 'us3dwh':
             metric_names += ['scale_log_mae', 'angle_mae_deg']
         metric_sums = {name: torch.zeros((), device=device) for name in metric_names}
@@ -341,6 +392,7 @@ def main():
                 & (depth >= args.min_depth) & (depth <= args.max_depth)
             )
             current = eval_depth(pred[eval_mask], depth[eval_mask])
+            current.update(height_diagnostics(pred[eval_mask], depth[eval_mask]))
             for name, value in current.items():
                 metric_sums[name] += value
                 metric_counts[name] += 1
