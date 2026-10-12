@@ -116,7 +116,7 @@ def build_optimizer(model, args):
         })
     groups.append({
         'params': list(model.depth_head.parameters()),
-        'lr': args.lr * 10.0,
+        'lr': args.lr,
         'name': 'depth_head',
     })
     if args.dataset == 'us3dwh':
