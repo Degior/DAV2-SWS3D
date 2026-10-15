@@ -14,12 +14,12 @@ from dataset.transform import Crop, NormalizeImage, PrepareForNet, Resize
 
 
 class M4Heights(Dataset):
-    def __init__(self, filelist_path, mode, size=(518, 518), height_scale=1.0):
+    def __init__(self, filelist_path, mode, size=(518, 518), height_scale=1.0, data_root=None):
         if mode not in ('train', 'val'):
             raise ValueError(f'Unsupported mode: {mode}')
         if not math.isfinite(height_scale) or height_scale <= 0:
             raise ValueError('height_scale must be finite and positive')
-        self.root, self.samples = load_manifest(filelist_path)
+        self.root, self.samples = load_manifest(filelist_path, data_root=data_root)
         self.mode = mode
         self.height_scale = height_scale
         self._archive_pid = None

@@ -30,6 +30,7 @@ parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
 parser.add_argument('--m4heights-train-split', help='Add M4Heights manifest to US3D training')
 parser.add_argument('--m4heights-val-split', help='Also add M4Heights manifest to US3D validation')
+parser.add_argument('--m4heights-data-root', help='Override M4Heights data root independently of the manifest location')
 parser.add_argument('--m4heights-height-scale', default=1.0, type=float, help='Multiplier to metres; M4Heights default is 1')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
@@ -178,13 +179,15 @@ def build_datasets(args, size):
         from dataset.m4heights import M4Heights
         dataset_class = M4Heights
         dataset_kwargs['height_scale'] = args.m4heights_height_scale
+        dataset_kwargs['data_root'] = args.m4heights_data_root
     else:
         dataset_class = US3D
     trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
     valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
     if args.m4heights_train_split or args.m4heights_val_split:
         from dataset.m4heights import M4Heights
-        m4_kwargs = {'size': size, 'height_scale': args.m4heights_height_scale}
+        m4_kwargs = {'size': size, 'height_scale': args.m4heights_height_scale,
+                     'data_root': args.m4heights_data_root}
         if args.m4heights_train_split:
             trainset = ConcatDataset([trainset, M4Heights(args.m4heights_train_split, 'train', **m4_kwargs)])
         if args.m4heights_val_split:

@@ -32,12 +32,13 @@ def index_tiffs(root, relative_paths):
     return records
 
 
-def load_manifest(path):
+def load_manifest(path, data_root=None):
     path = Path(path).resolve()
     manifest = json.loads(path.read_text(encoding='utf-8'))
     if manifest.get('version') != 1 or not manifest.get('samples'):
         raise ValueError(f'Expected a nonempty M4Heights v1 manifest: {path}')
-    root = (path.parent / manifest['data_root']).resolve()
+    root = (Path(data_root).expanduser().resolve() if data_root is not None
+            else (path.parent / manifest['data_root']).resolve())
     for sample in manifest['samples']:
         for key in ('image', 'height'):
             resolve_reference(root, sample[key])

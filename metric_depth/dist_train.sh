@@ -18,7 +18,8 @@ initial_height=1.0
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
 save_path=exp/us3d_m4heights_softplus
 port=20596
-m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-/misc/home6/s0032/DAV2-SWS3D/metric_depth/dataset/m4heights/splits/train.json}
+m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-dataset/m4heights/splits/train.json}
+m4heights_data_root=${M4HEIGHTS_DATA_ROOT:-/misc/home6/m_imm_freedata/m4heights}
 
 mkdir -p $save_path
 
@@ -43,4 +44,5 @@ torchrun \
     --initial-height $initial_height \
     --pretrained-from $pretrained_from \
     --m4heights-train-split "$m4heights_train_split" \
+    --m4heights-data-root "$m4heights_data_root" \
     2>&1 | tee -a $save_path/$now.log
