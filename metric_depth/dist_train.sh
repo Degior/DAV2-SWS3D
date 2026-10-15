@@ -11,12 +11,10 @@ lr_scheduler=constant
 encoder=vitl
 dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
-min_depth=0
+min_depth=0.1
 max_depth=250
-height_activation=softplus
-initial_height=1.0
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_m4heights_softplus
+save_path=exp/us3d_m4heights_min01
 port=20596
 m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-dataset/m4heights/splits/train.json}
 m4heights_data_root=${M4HEIGHTS_DATA_ROOT:-/misc/home6/m_imm_freedata/m4heights}
@@ -40,8 +38,6 @@ torchrun \
     --img-size $img_size \
     --min-depth $min_depth \
     --max-depth $max_depth \
-    --height-activation $height_activation \
-    --initial-height $initial_height \
     --pretrained-from $pretrained_from \
     --m4heights-train-split "$m4heights_train_split" \
     --m4heights-data-root "$m4heights_data_root" \

@@ -2,34 +2,8 @@
 
 import io
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import zipfile
-
-
-def index_tiffs(root, relative_paths):
-    """Index by basename: ORTHO and LABEL use the same tile filename."""
-    root = Path(root)
-    records = {}
-    for relative_path in relative_paths:
-        path = root / relative_path
-        if not path.is_file():
-            raise FileNotFoundError(path)
-        if path.suffix.lower() == '.zip':
-            with zipfile.ZipFile(path) as archive:
-                members = [name for name in archive.namelist()
-                           if PurePosixPath(name).suffix.lower() in ('.tif', '.tiff')
-                           and '__MACOSX' not in PurePosixPath(name).parts]
-            references = [(PurePosixPath(name).name, {'path': relative_path, 'member': name})
-                          for name in members]
-        else:
-            references = [(path.name, {'path': relative_path})]
-        for name, reference in references:
-            if name in records:
-                raise ValueError(f'Duplicate tile filename: {name}')
-            records[name] = reference
-    if not records:
-        raise ValueError('No TIFF tiles found in the selected files')
-    return records
 
 
 def load_manifest(path, data_root=None):
