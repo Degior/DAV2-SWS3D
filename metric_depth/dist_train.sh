@@ -12,9 +12,10 @@ encoder=vitl
 dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
 min_depth=0.1
+zero_height_after_epochs=15
 max_depth=250
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_m4heights_min01
+save_path=exp/us3d_m4heights_zero_after15
 port=20596
 m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-dataset/m4heights/splits/train.json}
 m4heights_data_root=${M4HEIGHTS_DATA_ROOT:-/misc/home6/m_imm_freedata/m4heights}
@@ -37,6 +38,7 @@ torchrun \
     --dataset $dataset \
     --img-size $img_size \
     --min-depth $min_depth \
+    --zero-height-after-epochs $zero_height_after_epochs \
     --max-depth $max_depth \
     --pretrained-from $pretrained_from \
     --m4heights-train-split "$m4heights_train_split" \
