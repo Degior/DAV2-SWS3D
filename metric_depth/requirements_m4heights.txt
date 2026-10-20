@@ -1,4 +1,3 @@
-# Additional dependencies for preparing and reading M4Heights.
-huggingface_hub>=1.0
+# Additional dependencies for reading M4Heights.
 tifffile
 imagecodecs

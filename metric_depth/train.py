@@ -34,7 +34,8 @@ parser.add_argument('--m4heights-data-root', help='Override M4Heights data root 
 parser.add_argument('--m4heights-height-scale', default=1.0, type=float, help='Multiplier to metres; M4Heights default is 1')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
-parser.add_argument('--min-depth', default=0.1, type=float)
+parser.add_argument('--min-depth', default=0.1, type=float,
+                    help='Minimum training target height before zero-height inclusion; validation has no lower cutoff')
 parser.add_argument('--zero-height-after-epochs', type=int,
                     help='Include zero heights in training after N completed epochs (default: 15; resume uses checkpoint setting)')
 parser.add_argument('--max-depth', default=250.0, type=float)
@@ -278,7 +279,10 @@ def main():
         if 'optimizer' in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint['optimizer'])
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
-        best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        if resume_checkpoint.get('validation_min_depth', 'legacy') is None:
+            best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        elif rank == 0:
+            logger.info('Resetting best RMSE for validation without a lower height cutoff')
 
     total_iters = args.epochs * len(trainloader)
 
@@ -295,8 +299,8 @@ def main():
         epoch_loss = 0.0
         train_min_depth = 0.0 if epoch >= args.zero_height_after_epochs else args.min_depth
         if rank == 0:
-            logger.info('Epoch %d: training min-depth %.3f m; validation min-depth %.3f m',
-                        epoch + 1, train_min_depth, args.min_depth)
+            logger.info('Epoch %d: training min-depth %.3f m; validation uses all valid target heights up to %.3f m',
+                        epoch + 1, train_min_depth, args.max_depth)
             writer.add_scalar('train/min_depth', train_min_depth, epoch * len(trainloader))
 
         for i, sample in enumerate(trainloader):
@@ -368,7 +372,7 @@ def main():
 
             eval_mask = (
                 valid_mask.bool() & torch.isfinite(depth) & torch.isfinite(pred)
-                & (depth >= args.min_depth) & (depth <= args.max_depth)
+                & (depth <= args.max_depth)
             )
             current = eval_depth(pred[eval_mask], depth[eval_mask])
             for name, value in current.items():
@@ -410,6 +414,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
+                'validation_min_depth': None,
                 'args': vars(args),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
