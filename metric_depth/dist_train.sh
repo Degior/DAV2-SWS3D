@@ -6,16 +6,18 @@ export OPENCV_LOG_LEVEL=ERROR
 epochs=50
 bs=4
 gpus=1
-lr=0.0000005
+lr=0.000005
 lr_scheduler=constant
 encoder=vitl
 dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
-min_depth=0
+min_depth=0.1
 max_depth=250
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_berhu_1
+save_path=exp/us3d_m4heights_min01
 port=20596
+m4heights_train_split=${M4HEIGHTS_TRAIN_SPLIT:-dataset/m4heights/splits/train.json}
+m4heights_data_root=${M4HEIGHTS_DATA_ROOT:-/misc/home6/m_imm_freedata/m4heights}
 
 mkdir -p $save_path
 
@@ -37,4 +39,6 @@ torchrun \
     --min-depth $min_depth \
     --max-depth $max_depth \
     --pretrained-from $pretrained_from \
+    --m4heights-train-split "$m4heights_train_split" \
+    --m4heights-data-root "$m4heights_data_root" \
     2>&1 | tee -a $save_path/$now.log

@@ -11,27 +11,34 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from util.dist_helper import setup_distributed
 from util.loss import BerHuLoss, HeightLoss
 from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
 
 
-parser = argparse.ArgumentParser(description='Depth Anything V2 for US3D height estimation')
+parser = argparse.ArgumentParser(description='Depth Anything V2 for overhead height estimation')
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
-parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh'])
+parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh', 'm4heights'])
 parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
+parser.add_argument('--m4heights-train-split', help='Add M4Heights manifest to US3D training')
+parser.add_argument('--m4heights-val-split', help='Also add M4Heights manifest to US3D validation')
+parser.add_argument('--m4heights-data-root', help='Override M4Heights data root independently of the manifest location')
+parser.add_argument('--m4heights-height-scale', default=1.0, type=float, help='Multiplier to metres; M4Heights default is 1')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
-parser.add_argument('--min-depth', default=0.0, type=float)
+parser.add_argument('--min-depth', default=0.1, type=float,
+                    help='Minimum training target height; validation has no lower cutoff')
 parser.add_argument('--max-depth', default=250.0, type=float)
+parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
+                    help='Fresh training defaults to sigmoid; resume uses checkpoint mode')
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--num-workers', default=4, type=int)
@@ -109,7 +116,7 @@ def build_optimizer(model, args):
         })
     groups.append({
         'params': list(model.depth_head.parameters()),
-        'lr': args.lr * 10.0,
+        'lr': args.lr,
         'name': 'depth_head',
     })
     if args.dataset == 'us3dwh':
@@ -138,6 +145,31 @@ def reduce_metric_dict(metric_sums, metric_counts):
     }
 
 
+def build_datasets(args, size):
+    dataset_kwargs = {'size': size}
+    if args.dataset == 'us3dwh':
+        dataset_class = US3DWH
+        dataset_kwargs['angle_unit'] = args.angle_unit
+    elif args.dataset == 'm4heights':
+        from dataset.m4heights import M4Heights
+        dataset_class = M4Heights
+        dataset_kwargs['height_scale'] = args.m4heights_height_scale
+        dataset_kwargs['data_root'] = args.m4heights_data_root
+    else:
+        dataset_class = US3D
+    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
+    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    if args.m4heights_train_split or args.m4heights_val_split:
+        from dataset.m4heights import M4Heights
+        m4_kwargs = {'size': size, 'height_scale': args.m4heights_height_scale,
+                     'data_root': args.m4heights_data_root}
+        if args.m4heights_train_split:
+            trainset = ConcatDataset([trainset, M4Heights(args.m4heights_train_split, 'train', **m4_kwargs)])
+        if args.m4heights_val_split:
+            valset = ConcatDataset([valset, M4Heights(args.m4heights_val_split, 'val', **m4_kwargs)])
+    return trainset, valset
+
+
 def main():
     args = parser.parse_args()
     if args.pretrained_from and args.resume:
@@ -146,6 +178,21 @@ def main():
         parser.error('--hflip-prob must be between 0 and 1')
     if args.min_depth < 0 or args.max_depth <= args.min_depth:
         parser.error('Expected 0 <= min-depth < max-depth')
+    if not math.isfinite(args.m4heights_height_scale) or args.m4heights_height_scale <= 0:
+        parser.error('--m4heights-height-scale must be finite and positive')
+    if (args.m4heights_train_split or args.m4heights_val_split) and args.dataset != 'us3d':
+        parser.error('Additional M4Heights manifests require --dataset us3d (height-only training)')
+    resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
+    if resume_checkpoint is not None:
+        saved_activation = checkpoint_height_activation(resume_checkpoint)
+        if args.height_activation is not None and args.height_activation != saved_activation:
+            parser.error('--height-activation must match the resumed checkpoint')
+        saved_args = resume_checkpoint.get('args', {})
+        if 'max_depth' in saved_args and args.max_depth != saved_args['max_depth']:
+            parser.error('--max-depth must match the resumed checkpoint')
+        args.height_activation = saved_activation
+    else:
+        args.height_activation = args.height_activation or 'sigmoid'
 
     logger = init_log('global', logging.INFO)
     logger.propagate = False
@@ -165,17 +212,11 @@ def main():
         logger.info('%s\n', pprint.pformat({**vars(args), 'ngpus': world_size}))
 
     size = (args.img_size, args.img_size)
-    dataset_kwargs = {'size': size}
-    if args.dataset == 'us3dwh':
-        dataset_class = US3DWH
-        dataset_kwargs['angle_unit'] = args.angle_unit
-        if args.hflip_prob > 0 and rank == 0:
-            logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
-    else:
-        dataset_class = US3D
-
-    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
-    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    if args.dataset == 'us3dwh' and args.hflip_prob > 0 and rank == 0:
+        logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
+    trainset, valset = build_datasets(args, size)
+    if rank == 0:
+        logger.info('Dataset sizes: %d train / %d val', len(trainset), len(valset))
     trainsampler = torch.utils.data.distributed.DistributedSampler(
         trainset, num_replicas=world_size, rank=rank, shuffle=True
     )
@@ -192,13 +233,12 @@ def main():
     )
 
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
-    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
+    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
+                           'height_activation': args.height_activation})
 
-    resume_checkpoint = None
     if args.pretrained_from:
         load_pretrained_backbone(model, args.pretrained_from, logger)
-    elif args.resume:
-        resume_checkpoint = torch.load(args.resume, map_location='cpu')
+    if resume_checkpoint is not None:
         model.load_state_dict(extract_model_state(resume_checkpoint), strict=True)
         if rank == 0:
             logger.info('Resumed model from %s', args.resume)
@@ -229,7 +269,10 @@ def main():
         if 'optimizer' in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint['optimizer'])
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
-        best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        if resume_checkpoint.get('validation_min_depth', 'legacy') is None:
+            best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        elif rank == 0:
+            logger.info('Resetting best RMSE for validation without a lower height cutoff')
 
     total_iters = args.epochs * len(trainloader)
 
@@ -251,7 +294,7 @@ def main():
             depth = sample['depth'].to(device, non_blocking=True)
             valid_mask = sample['valid_mask'].to(device, non_blocking=True)
 
-            if args.dataset == 'us3d' and random.random() < args.hflip_prob:
+            if args.dataset != 'us3dwh' and random.random() < args.hflip_prob:
                 img = img.flip(-1)
                 depth = depth.flip(-1)
                 valid_mask = valid_mask.flip(-1)
@@ -314,7 +357,7 @@ def main():
 
             eval_mask = (
                 valid_mask.bool() & torch.isfinite(depth) & torch.isfinite(pred)
-                & (depth >= args.min_depth) & (depth <= args.max_depth)
+                & (depth <= args.max_depth)
             )
             current = eval_depth(pred[eval_mask], depth[eval_mask])
             for name, value in current.items():
@@ -356,6 +399,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
+                'validation_min_depth': None,
                 'args': vars(args),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))

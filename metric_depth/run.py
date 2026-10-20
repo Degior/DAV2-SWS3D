@@ -7,7 +7,7 @@ import matplotlib
 import numpy as np
 import torch
 
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 
 
 MODEL_CONFIGS = {
@@ -117,7 +117,9 @@ def main():
     parser.add_argument('--outdir', default='./vis_height')
     parser.add_argument('--encoder', default='vitl', choices=list(MODEL_CONFIGS))
     parser.add_argument('--load-from', required=True)
-    parser.add_argument('--max-depth', type=float, default=250.0)
+    parser.add_argument('--max-depth', type=float, help='Defaults to checkpoint value, or 250 for bare weights')
+    parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
+                        help='For bare weights; otherwise inferred from checkpoint args')
     parser.add_argument('--vis-min', type=float, default=0.0)
     parser.add_argument('--vis-max', type=float)
     parser.add_argument('--save-numpy', action='store_true', help='save raw height predictions in meters')
@@ -136,10 +138,18 @@ def main():
         else 'cpu'
     )
     checkpoint = torch.load(args.load_from, map_location='cpu')
+    saved_args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
+    saved_activation = checkpoint_height_activation(checkpoint)
+    if saved_args and args.height_activation is not None and args.height_activation != saved_activation:
+        parser.error('--height-activation must match checkpoint args')
+    args.height_activation = args.height_activation or saved_activation
+    if args.max_depth is None:
+        args.max_depth = saved_args.get('max_depth', 250.0)
     state = extract_model_state(checkpoint)
     has_aux_heads = any(key.startswith(('scale_head.', 'angle_head.')) for key in state)
     model_class = DepthAnythingV2withHeads if has_aux_heads else DepthAnythingV2
-    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
+    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
+                           'height_activation': args.height_activation})
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
 
