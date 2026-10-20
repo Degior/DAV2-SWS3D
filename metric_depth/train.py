@@ -35,8 +35,6 @@ parser.add_argument('--m4heights-height-scale', default=1.0, type=float, help='M
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--min-depth', default=0.1, type=float)
-parser.add_argument('--zero-height-after-epochs', type=int,
-                    help='Include zero heights in training after N completed epochs (default: 15; resume uses checkpoint setting)')
 parser.add_argument('--max-depth', default=250.0, type=float)
 parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
                     help='Fresh training defaults to sigmoid; resume uses checkpoint mode')
@@ -195,14 +193,6 @@ def main():
     else:
         args.height_activation = args.height_activation or 'sigmoid'
 
-    if args.zero_height_after_epochs is None:
-        args.zero_height_after_epochs = (
-            saved_args.get('zero_height_after_epochs', 15)
-            if resume_checkpoint is not None else 15
-        )
-    if args.zero_height_after_epochs < 0:
-        parser.error('--zero-height-after-epochs must be nonnegative')
-
     logger = init_log('global', logging.INFO)
     logger.propagate = False
     rank, world_size = setup_distributed(port=args.port)
@@ -293,11 +283,6 @@ def main():
         trainsampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
-        train_min_depth = 0.0 if epoch >= args.zero_height_after_epochs else args.min_depth
-        if rank == 0:
-            logger.info('Epoch %d: training min-depth %.3f m; validation min-depth %.3f m',
-                        epoch + 1, train_min_depth, args.min_depth)
-            writer.add_scalar('train/min_depth', train_min_depth, epoch * len(trainloader))
 
         for i, sample in enumerate(trainloader):
             optimizer.zero_grad(set_to_none=True)
@@ -313,7 +298,7 @@ def main():
             outputs = model(img)
             train_mask = (
                 valid_mask.bool() & torch.isfinite(depth)
-                & (depth >= train_min_depth) & (depth <= args.max_depth)
+                & (depth >= args.min_depth) & (depth <= args.max_depth)
             )
 
             loss_parts = None
