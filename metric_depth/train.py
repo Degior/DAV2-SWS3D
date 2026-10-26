@@ -231,6 +231,14 @@ def main():
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
         best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
 
+    if rank == 0:
+        logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
+                    args.bs * world_size, args.bs, world_size)
+        logger.info('Optimizer learning rates: %s',
+                    {group['name']: group['lr'] for group in optimizer.param_groups})
+        if args.dataset != 'us3dwh':
+            logger.info('BerHu uses a shared global threshold and valid-pixel mean across GPUs.')
+
     total_iters = args.epochs * len(trainloader)
 
     def update_learning_rate(cur_iter):

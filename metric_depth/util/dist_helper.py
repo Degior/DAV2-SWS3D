@@ -11,10 +11,17 @@ def setup_distributed(backend="nccl", port=None):
     Originally licensed MIT, Copyright (c) 2020 Wei Li
     """
     num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        raise RuntimeError("No visible CUDA GPUs. Run training inside a GPU allocation.")
 
-    if "SLURM_JOB_ID" in os.environ:
+    if all(name in os.environ for name in ("RANK", "WORLD_SIZE", "LOCAL_RANK")):
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+    elif "SLURM_JOB_ID" in os.environ:
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
+        local_rank = int(os.environ.get("SLURM_LOCALID", rank)) % num_gpus
         node_list = os.environ["SLURM_NODELIST"]
         addr = subprocess.getoutput(f"scontrol show hostname {node_list} | head -n1")
         # specify master port
@@ -25,13 +32,17 @@ def setup_distributed(backend="nccl", port=None):
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = addr
         os.environ["WORLD_SIZE"] = str(world_size)
-        os.environ["LOCAL_RANK"] = str(rank % num_gpus)
+        os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["RANK"] = str(rank)
     else:
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank % num_gpus))
 
-    torch.cuda.set_device(rank % num_gpus)
+    if not 0 <= local_rank < num_gpus:
+        raise RuntimeError(f"LOCAL_RANK={local_rank}, but only {num_gpus} CUDA GPUs are visible.")
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    torch.cuda.set_device(local_rank)
 
     dist.init_process_group(
         backend=backend,

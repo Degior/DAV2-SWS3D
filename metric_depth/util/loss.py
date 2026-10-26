@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 
@@ -18,9 +19,10 @@ class SiLogLoss(nn.Module):
 
 
 class BerHuLoss(nn.Module):
-    def __init__(self, eps=1e-6):
+    def __init__(self, eps=1e-6, sync_distributed=True):
         super().__init__()
         self.eps = eps
+        self.sync_distributed = sync_distributed
 
     def forward(self, pred, target, valid_mask=None):
         if valid_mask is not None:
@@ -28,14 +30,20 @@ class BerHuLoss(nn.Module):
             pred = pred[valid_mask]
             target = target[valid_mask]
 
-        if pred.numel() == 0:
-            # Keep the graph connected so every DDP worker can still run backward.
+        distributed = (
+            self.sync_distributed and dist.is_available()
+            and dist.is_initialized() and dist.get_world_size() > 1
+        )
+        if pred.numel() == 0 and not distributed:
             return pred.sum() * 0.0
 
         error = pred - target
         abs_error = torch.abs(error)
 
-        c = (0.2 * torch.max(abs_error).detach()).clamp_min(self.eps)
+        max_error = abs_error.detach().max() if abs_error.numel() else abs_error.new_zeros(())
+        if distributed:
+            dist.all_reduce(max_error, op=dist.ReduceOp.MAX)
+        c = (0.2 * max_error).clamp_min(self.eps)
 
         l1_part = abs_error <= c
         l2_part = abs_error > c
@@ -44,7 +52,19 @@ class BerHuLoss(nn.Module):
         loss[l1_part] = abs_error[l1_part]
         loss[l2_part] = (error[l2_part] ** 2 + c.square()) / (2 * c)
 
-        return torch.mean(loss)
+        if not distributed:
+            return torch.mean(loss)
+
+        reduction_dtype = torch.float64 if loss.dtype == torch.float64 else torch.float32
+        local_sum = loss.sum(dtype=reduction_dtype)
+        count = torch.tensor(pred.numel(), device=pred.device, dtype=torch.int64)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        denominator = count.clamp_min(1).to(reduction_dtype)
+        global_sum = local_sum.detach().clone()
+        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+        backward_loss = local_sum * dist.get_world_size() / denominator
+        global_loss = global_sum / denominator
+        return backward_loss + (global_loss - backward_loss.detach())
 
 
 def r2_loss(pred, target):
