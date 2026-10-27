@@ -30,7 +30,10 @@ parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
-parser.add_argument('--min-depth', default=0.0, type=float)
+parser.add_argument('--min-depth', default=0.1, type=float,
+                    help='Minimum training target height before zero-height inclusion; validation includes zero heights')
+parser.add_argument('--zero-height-after-epochs', type=int,
+                    help='Include zero heights after N completed epochs (default: 15; resume uses checkpoint setting)')
 parser.add_argument('--max-depth', default=250.0, type=float)
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
@@ -147,6 +150,13 @@ def main():
     if args.min_depth < 0 or args.max_depth <= args.min_depth:
         parser.error('Expected 0 <= min-depth < max-depth')
 
+    resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
+    saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    if args.zero_height_after_epochs is None:
+        args.zero_height_after_epochs = saved_args.get('zero_height_after_epochs', 15)
+    if args.zero_height_after_epochs < 0:
+        parser.error('--zero-height-after-epochs must be nonnegative')
+
     logger = init_log('global', logging.INFO)
     logger.propagate = False
     rank, world_size = setup_distributed(port=args.port)
@@ -194,11 +204,9 @@ def main():
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
     model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
 
-    resume_checkpoint = None
     if args.pretrained_from:
         load_pretrained_backbone(model, args.pretrained_from, logger)
-    elif args.resume:
-        resume_checkpoint = torch.load(args.resume, map_location='cpu')
+    elif resume_checkpoint is not None:
         model.load_state_dict(extract_model_state(resume_checkpoint), strict=True)
         if rank == 0:
             logger.info('Resumed model from %s', args.resume)
@@ -229,7 +237,13 @@ def main():
         if 'optimizer' in resume_checkpoint:
             optimizer.load_state_dict(resume_checkpoint['optimizer'])
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
-        best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        saved_validation_min_depth = resume_checkpoint.get(
+            'validation_min_depth', saved_args.get('min_depth', 'legacy')
+        )
+        if saved_validation_min_depth in (None, 0.0):
+            best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
+        elif rank == 0:
+            logger.info('Resetting best RMSE for validation including zero-height targets')
 
     if rank == 0:
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
@@ -252,6 +266,11 @@ def main():
         trainsampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
+        train_min_depth = 0.0 if epoch >= args.zero_height_after_epochs else args.min_depth
+        if rank == 0:
+            logger.info('Epoch %d: training min-depth %.3f m; validation min-depth 0.000 m',
+                        epoch + 1, train_min_depth)
+            writer.add_scalar('train/min_depth', train_min_depth, epoch * len(trainloader))
 
         for i, sample in enumerate(trainloader):
             optimizer.zero_grad(set_to_none=True)
@@ -267,7 +286,7 @@ def main():
             outputs = model(img)
             train_mask = (
                 valid_mask.bool() & torch.isfinite(depth)
-                & (depth >= args.min_depth) & (depth <= args.max_depth)
+                & (depth >= train_min_depth) & (depth <= args.max_depth)
             )
 
             loss_parts = None
@@ -322,7 +341,7 @@ def main():
 
             eval_mask = (
                 valid_mask.bool() & torch.isfinite(depth) & torch.isfinite(pred)
-                & (depth >= args.min_depth) & (depth <= args.max_depth)
+                & (depth >= 0.0) & (depth <= args.max_depth)
             )
             current = eval_depth(pred[eval_mask], depth[eval_mask])
             for name, value in current.items():
@@ -364,6 +383,7 @@ def main():
                 'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
                 'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
+                'validation_min_depth': None,
                 'args': vars(args),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))

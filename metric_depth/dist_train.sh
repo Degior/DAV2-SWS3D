@@ -11,10 +11,11 @@ lr_scheduler=constant
 encoder=vitl
 dataset=us3d # use us3dwh only for the scale/angle ablation
 img_size=518
-min_depth=0
+min_depth=0.1
+zero_height_after_epochs=15
 max_depth=250
 pretrained_from=../checkpoints/depth_anything_v2_${encoder}.pth
-save_path=exp/us3d_berhu_1
+save_path=exp/us3d_zero_after15_${now}
 port=20596
 
 mkdir -p $save_path
@@ -35,6 +36,7 @@ torchrun \
     --dataset $dataset \
     --img-size $img_size \
     --min-depth $min_depth \
+    --zero-height-after-epochs $zero_height_after_epochs \
     --max-depth $max_depth \
     --pretrained-from $pretrained_from \
     2>&1 | tee -a $save_path/$now.log
