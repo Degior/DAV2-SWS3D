@@ -8,6 +8,15 @@ from .dinov2 import DINOv2
 from .util.blocks import FeatureFusionBlock, _make_scratch
 from .util.transform import Resize, NormalizeImage, PrepareForNet
 
+
+def checkpoint_height_activation(checkpoint):
+    args = checkpoint.get('args', {}) if isinstance(checkpoint, dict) else {}
+    activation = args.get('height_activation', 'sigmoid')
+    if activation not in ('sigmoid', 'softplus'):
+        raise ValueError(f'Unsupported checkpoint height activation: {activation}')
+    return activation
+
+
 def _make_fusion_block(features, use_bn, size=None):
     return FeatureFusionBlock(
         features,
@@ -41,11 +50,14 @@ class DPTHead(nn.Module):
             features=256,
             use_bn=False,
             out_channels=[256, 512, 1024, 1024],
-            use_clstoken=False
+            use_clstoken=False,
+            height_activation='sigmoid'
     ):
         super(DPTHead, self).__init__()
 
         self.use_clstoken = use_clstoken
+        if height_activation not in ('sigmoid', 'softplus'):
+            raise ValueError(f'Unsupported height activation: {height_activation}')
 
         self.projects = nn.ModuleList([
             nn.Conv2d(
@@ -109,7 +121,7 @@ class DPTHead(nn.Module):
             nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
             nn.ReLU(True),
             nn.Conv2d(head_features_2, 1, kernel_size=1, stride=1, padding=0),
-            nn.Sigmoid() # nn.Identity()
+            nn.Softplus() if height_activation == 'softplus' else nn.Sigmoid()
         )
 
     def forward(self, out_features, patch_h, patch_w):
@@ -156,7 +168,8 @@ class DepthAnythingV2(nn.Module):
             out_channels=[256, 512, 1024, 1024],
             use_bn=False,
             use_clstoken=False,
-            max_depth=20.0
+            max_depth=20.0,
+            height_activation='sigmoid'
     ):
         super(DepthAnythingV2, self).__init__()
 
@@ -168,12 +181,13 @@ class DepthAnythingV2(nn.Module):
         }
 
         self.max_depth = max_depth
+        self.height_activation = height_activation
 
         self.encoder = encoder
         self.pretrained = DINOv2(model_name=encoder)
 
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels,
-                                  use_clstoken=use_clstoken)
+                                  use_clstoken=use_clstoken, height_activation=height_activation)
 
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
@@ -181,7 +195,9 @@ class DepthAnythingV2(nn.Module):
         features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
                                                            return_class_token=True)
 
-        depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
+        depth = self.depth_head(features, patch_h, patch_w)
+        if self.height_activation == 'sigmoid':
+            depth = depth * self.max_depth
 
         return depth.squeeze(1)
 
@@ -314,7 +330,8 @@ class DepthAnythingV2withHeads(nn.Module):
             use_clstoken=True,
             max_depth=20.0,
             head_hidden_dim=512,
-            head_dropout=0.1
+            head_dropout=0.1,
+            height_activation='sigmoid'
     ):
         super(DepthAnythingV2withHeads, self).__init__()
 
@@ -326,6 +343,7 @@ class DepthAnythingV2withHeads(nn.Module):
         }
 
         self.max_depth = max_depth
+        self.height_activation = height_activation
         self.encoder = encoder
 
         self.pretrained = DINOv2(model_name=encoder)
@@ -335,7 +353,8 @@ class DepthAnythingV2withHeads(nn.Module):
             features,
             use_bn,
             out_channels=out_channels,
-            use_clstoken=use_clstoken
+            use_clstoken=use_clstoken,
+            height_activation=height_activation
         )
 
         embed_dim = self.pretrained.embed_dim
@@ -366,7 +385,9 @@ class DepthAnythingV2withHeads(nn.Module):
             return_class_token=True
         )
 
-        depth = self.depth_head(features, patch_h, patch_w) * self.max_depth
+        depth = self.depth_head(features, patch_h, patch_w)
+        if self.height_activation == 'sigmoid':
+            depth = depth * self.max_depth
         depth = depth.squeeze(1)
 
         log_scale = self.scale_head(features).squeeze(1)

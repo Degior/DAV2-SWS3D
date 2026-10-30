@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads
+from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from util.dist_helper import setup_distributed
 from util.loss import BerHuLoss, HeightLoss
 from util.metric import METRIC_NAMES, eval_depth
@@ -35,6 +35,8 @@ parser.add_argument('--min-depth', default=0.1, type=float,
 parser.add_argument('--zero-height-after-epochs', type=int,
                     help='Include zero heights after N completed epochs (default: 15; resume uses checkpoint setting)')
 parser.add_argument('--max-depth', default=250.0, type=float)
+parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
+                    help='Fresh training defaults to sigmoid; resume uses the checkpoint activation')
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--num-workers', default=4, type=int)
@@ -152,6 +154,15 @@ def main():
 
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    if resume_checkpoint is not None:
+        saved_activation = checkpoint_height_activation(resume_checkpoint)
+        if args.height_activation is not None and args.height_activation != saved_activation:
+            parser.error('--height-activation must match the resumed checkpoint')
+        if 'max_depth' in saved_args and args.max_depth != saved_args['max_depth']:
+            parser.error('--max-depth must match the resumed checkpoint')
+        args.height_activation = saved_activation
+    else:
+        args.height_activation = args.height_activation or 'sigmoid'
     if args.zero_height_after_epochs is None:
         args.zero_height_after_epochs = saved_args.get('zero_height_after_epochs', 15)
     if args.zero_height_after_epochs < 0:
@@ -202,7 +213,8 @@ def main():
     )
 
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
-    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth})
+    model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
+                           'height_activation': args.height_activation})
 
     if args.pretrained_from:
         load_pretrained_backbone(model, args.pretrained_from, logger)
