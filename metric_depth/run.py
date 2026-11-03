@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from util.inference import predict_height_tiled, tile_starts
 
 
@@ -85,6 +86,8 @@ def main():
                         help='use the previous whole-image resizing method')
     parser.add_argument('--outdir', default='./vis_height')
     parser.add_argument('--encoder', default='vitl', choices=list(MODEL_CONFIGS))
+    parser.add_argument('--attention-backend', choices=['manual', 'sdpa'],
+                        help='Defaults to the checkpoint backend, or original attention for legacy weights')
     parser.add_argument('--load-from', required=True)
     parser.add_argument('--max-depth', type=float, help='Defaults to the checkpoint value, or 250 for bare weights')
     parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
@@ -121,6 +124,7 @@ def main():
     model_class = DepthAnythingV2withHeads if has_aux_heads else DepthAnythingV2
     model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
                            'height_activation': args.height_activation})
+    set_attention_backend(model, args.attention_backend or saved_args.get('attention_backend', 'manual'))
     model.load_state_dict(state, strict=True)
     model = model.to(device).eval()
 

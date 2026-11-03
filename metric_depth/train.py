@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
 from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from util.dist_helper import setup_distributed
 from util.loss import BerHuLoss, HeightLoss
 from util.inference import predict_height_tiled
@@ -26,6 +27,8 @@ from util.utils import depth_to_colormap, init_log
 
 parser = argparse.ArgumentParser(description='Depth Anything V2 for US3D height estimation')
 parser.add_argument('--encoder', default='vitl', choices=['vits', 'vitb', 'vitl', 'vitg'])
+parser.add_argument('--attention-backend', choices=['manual', 'sdpa'],
+                    help='Fresh training defaults to the original attention; resume inherits the saved backend')
 parser.add_argument('--dataset', default='us3d', choices=['us3d', 'us3dwh'])
 parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
@@ -159,6 +162,7 @@ def main():
 
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    args.attention_backend = args.attention_backend or saved_args.get('attention_backend', 'manual')
     if args.sampling_mode is None:
         args.sampling_mode = saved_args.get(
             'sampling_mode', 'resize' if resume_checkpoint is not None or args.dataset == 'us3dwh' else 'native'
@@ -237,6 +241,7 @@ def main():
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
     model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
                            'height_activation': args.height_activation})
+    set_attention_backend(model, args.attention_backend)
 
     if args.pretrained_from:
         load_pretrained_backbone(model, args.pretrained_from, logger)
@@ -288,6 +293,7 @@ def main():
             logger.info('Resetting best RMSE for validation including zero-height targets')
 
     if rank == 0:
+        logger.info('Attention backend: %s', args.attention_backend)
         if args.sampling_mode == 'native':
             logger.info('Training: native %dx%d random crops; validation: native tiles with %d px overlap',
                         args.img_size, args.img_size, args.val_tile_overlap)
