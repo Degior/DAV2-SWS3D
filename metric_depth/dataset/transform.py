@@ -248,6 +248,30 @@ class PrepareForNet(object):
         return sample
 
 
+class NativeCrop:
+    def __init__(self, size):
+        self.height, self.width = size
+
+    def __call__(self, sample):
+        height, width = sample['image'].shape[:2]
+        pad_height = max(0, self.height - height)
+        pad_width = max(0, self.width - width)
+        if pad_height or pad_width:
+            sample['image'] = np.pad(
+                sample['image'], ((0, pad_height), (0, pad_width), (0, 0)), mode='edge'
+            )
+            sample['depth'] = np.pad(
+                sample['depth'], ((0, pad_height), (0, pad_width)),
+                mode='constant', constant_values=np.nan,
+            )
+        height, width = sample['image'].shape[:2]
+        top = np.random.randint(0, height - self.height + 1)
+        left = np.random.randint(0, width - self.width + 1)
+        sample['image'] = sample['image'][top:top + self.height, left:left + self.width]
+        sample['depth'] = sample['depth'][top:top + self.height, left:left + self.width]
+        return sample
+
+
 class Crop(object):
     """Crop sample for batch-wise training. Image is of shape CxHxW
     """

@@ -4,14 +4,17 @@ import numpy as np
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 
-from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop
+from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop, NativeCrop
 
 
 class US3D(Dataset):
 
-    def __init__(self, filelist_path, mode, size=(518, 518)):
+    def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize'):
         self.mode = mode
         self.size = size
+        if sampling_mode not in {'resize', 'native'}:
+            raise ValueError(f'Unsupported sampling mode: {sampling_mode}')
+        self.sampling_mode = sampling_mode
 
         with open(filelist_path, 'r') as f:
             lines = f.read().splitlines()
@@ -29,8 +32,9 @@ class US3D(Dataset):
         self.filelist = [record[:2] for record in records]
 
         net_w, net_h = size
-        self.transform = Compose([
-            Resize(
+        transforms = []
+        if sampling_mode == 'resize':
+            transforms.append(Resize(
                 width=net_w,
                 height=net_h,
                 resize_target=(mode == 'train'),
@@ -38,11 +42,14 @@ class US3D(Dataset):
                 ensure_multiple_of=14,
                 resize_method='lower_bound',
                 image_interpolation_method=cv2.INTER_CUBIC,
-            ),
+            ))
+        elif mode == 'train':
+            transforms.append(NativeCrop((net_h, net_w)))
+        self.transform = Compose(transforms + [
             NormalizeImage(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225]),
             PrepareForNet(),
-        ] + ([Crop(size[0])] if self.mode == 'train' else []))
+        ] + ([Crop(size[0])] if mode == 'train' and sampling_mode == 'resize' else []))
 
     # @staticmethod
     # def transform_height(z):

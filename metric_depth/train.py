@@ -19,6 +19,7 @@ from dataset.us3d_with_heads import US3DWH
 from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from util.dist_helper import setup_distributed
 from util.loss import BerHuLoss, HeightLoss
+from util.inference import predict_height_tiled
 from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
 
@@ -30,6 +31,10 @@ parser.add_argument('--train-split', default='dataset/splits/us3d/train.txt')
 parser.add_argument('--val-split', default='dataset/splits/us3d/val.txt')
 parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
+parser.add_argument('--sampling-mode', choices=['resize', 'native'],
+                    help='Fresh US3D training uses native crops; resume inherits the checkpoint mode')
+parser.add_argument('--val-tile-overlap', type=int,
+                    help='Native validation tile overlap (default: 126; resume inherits the saved value)')
 parser.add_argument('--min-depth', default=0.1, type=float,
                     help='Minimum training target height before zero-height inclusion; validation includes zero heights')
 parser.add_argument('--zero-height-after-epochs', type=int,
@@ -154,6 +159,22 @@ def main():
 
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    if args.sampling_mode is None:
+        args.sampling_mode = saved_args.get(
+            'sampling_mode', 'resize' if resume_checkpoint is not None or args.dataset == 'us3dwh' else 'native'
+        )
+    if args.val_tile_overlap is None:
+        args.val_tile_overlap = saved_args.get('val_tile_overlap', 126)
+    if args.sampling_mode == 'native':
+        if args.dataset != 'us3d':
+            parser.error('Native crops currently require --dataset us3d')
+        if args.img_size < 14 or args.img_size % 14:
+            parser.error('--img-size must be a positive multiple of 14 for native crops')
+        if not 0 <= args.val_tile_overlap < args.img_size:
+            parser.error('--val-tile-overlap must be between 0 and --img-size - 1')
+    validation_inference = {'sampling_mode': args.sampling_mode, 'img_size': args.img_size}
+    if args.sampling_mode == 'native':
+        validation_inference['overlap'] = args.val_tile_overlap
     if resume_checkpoint is not None:
         saved_activation = checkpoint_height_activation(resume_checkpoint)
         if args.height_activation is not None and args.height_activation != saved_activation:
@@ -194,6 +215,7 @@ def main():
             logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
     else:
         dataset_class = US3D
+        dataset_kwargs['sampling_mode'] = args.sampling_mode
 
     trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
     valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
@@ -252,12 +274,25 @@ def main():
         saved_validation_min_depth = resume_checkpoint.get(
             'validation_min_depth', saved_args.get('min_depth', 'legacy')
         )
-        if saved_validation_min_depth in (None, 0.0):
+        saved_validation_inference = resume_checkpoint.get('validation_inference', {
+            'sampling_mode': saved_args.get('sampling_mode', 'resize'),
+            'img_size': saved_args.get('img_size', 518),
+        })
+        if saved_validation_inference != validation_inference:
+            if rank == 0:
+                logger.info('Resetting best RMSE because validation inference changed: %s -> %s',
+                            saved_validation_inference, validation_inference)
+        elif saved_validation_min_depth in (None, 0.0):
             best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
         elif rank == 0:
             logger.info('Resetting best RMSE for validation including zero-height targets')
 
     if rank == 0:
+        if args.sampling_mode == 'native':
+            logger.info('Training: native %dx%d random crops; validation: native tiles with %d px overlap',
+                        args.img_size, args.img_size, args.val_tile_overlap)
+        else:
+            logger.info('Training and validation use whole-image resizing to input size %d', args.img_size)
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
                     args.bs * world_size, args.bs, world_size)
         logger.info('Optimizer learning rates: %s',
@@ -345,11 +380,16 @@ def main():
             depth = sample['depth'].to(device, non_blocking=True)[0]
             valid_mask = sample['valid_mask'].to(device, non_blocking=True)[0]
             with torch.no_grad():
-                outputs = model(img)
-                pred = outputs['depth'] if args.dataset == 'us3dwh' else outputs
-                pred = F.interpolate(
-                    pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True
-                )[0, 0]
+                if args.sampling_mode == 'native':
+                    pred = predict_height_tiled(
+                        model.module, img, args.img_size, args.val_tile_overlap, batch_size=args.bs
+                    )[0]
+                else:
+                    outputs = model(img)
+                    pred = outputs['depth'] if args.dataset == 'us3dwh' else outputs
+                    pred = F.interpolate(
+                        pred[:, None], depth.shape[-2:], mode='bilinear', align_corners=True
+                    )[0, 0]
 
             eval_mask = (
                 valid_mask.bool() & torch.isfinite(depth) & torch.isfinite(pred)
@@ -396,6 +436,7 @@ def main():
                 'epoch': epoch,
                 'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
                 'validation_min_depth': None,
+                'validation_inference': validation_inference,
                 'args': vars(args),
             }
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
