@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -65,6 +67,41 @@ class BerHuLoss(nn.Module):
         backward_loss = local_sum * dist.get_world_size() / denominator
         global_loss = global_sum / denominator
         return backward_loss + (global_loss - backward_loss.detach())
+
+
+class L1MSELoss(nn.Module):
+    def __init__(self, mse_weight=0.05, sync_distributed=True):
+        super().__init__()
+        if not math.isfinite(mse_weight) or mse_weight < 0:
+            raise ValueError('mse_weight must be finite and nonnegative')
+        self.mse_weight = mse_weight
+        self.sync_distributed = sync_distributed
+
+    def forward(self, pred, target, valid_mask=None, global_valid_count=None):
+        if valid_mask is not None:
+            valid_mask = valid_mask.detach().bool()
+            pred, target = pred[valid_mask], target[valid_mask]
+        distributed = (
+            self.sync_distributed and dist.is_available()
+            and dist.is_initialized() and dist.get_world_size() > 1
+        )
+        error = pred - target
+        values = error.abs() + self.mse_weight * error.square()
+        reduction_dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
+        local_sum = values.sum(dtype=reduction_dtype)
+        if global_valid_count is None:
+            count = torch.tensor(pred.numel(), device=pred.device, dtype=torch.int64)
+            if distributed:
+                dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        else:
+            count = global_valid_count.detach().to(device=pred.device)
+        denominator = count.clamp_min(1).to(reduction_dtype)
+        if not distributed:
+            return local_sum / denominator
+        global_sum = local_sum.detach().clone()
+        dist.all_reduce(global_sum, op=dist.ReduceOp.SUM)
+        backward_loss = local_sum * dist.get_world_size() / denominator
+        return backward_loss + (global_sum / denominator - backward_loss.detach())
 
 
 def r2_loss(pred, target):

@@ -5,6 +5,7 @@ import math
 import os
 import pprint
 import random
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from dataset.us3d_with_heads import US3DWH
 from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from util.dist_helper import setup_distributed
-from util.loss import BerHuLoss, HeightLoss
+from util.loss import BerHuLoss, HeightLoss, L1MSELoss
 from util.inference import predict_height_tiled
 from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
@@ -48,6 +49,12 @@ parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
                     help='Fresh training defaults to sigmoid; resume uses the checkpoint activation')
 parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
+parser.add_argument('--micro-batch-size', type=int,
+                    help='Images per forward pass; --bs remains the effective per-GPU optimizer batch')
+parser.add_argument('--height-loss', choices=['berhu', 'l1-mse'],
+                    help='US3D height loss; fresh/legacy runs use berhu, resume inherits the saved loss')
+parser.add_argument('--mse-weight', type=float,
+                    help='Squared-error coefficient for l1-mse (default: 0.05; resume inherits it)')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--lr', default=5e-6, type=float)
 parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
@@ -163,6 +170,19 @@ def main():
 
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    args.height_loss = args.height_loss or saved_args.get('height_loss', 'berhu')
+    if args.mse_weight is None:
+        args.mse_weight = saved_args.get('mse_weight', 0.05)
+    if args.micro_batch_size is None:
+        args.micro_batch_size = saved_args.get('micro_batch_size', args.bs)
+    if not math.isfinite(args.mse_weight) or args.mse_weight < 0:
+        parser.error('--mse-weight must be finite and nonnegative')
+    if args.bs < 1 or args.micro_batch_size < 1 or args.bs % args.micro_batch_size:
+        parser.error('--bs must be positive and divisible by --micro-batch-size')
+    if args.dataset != 'us3d' and args.height_loss != 'berhu':
+        parser.error('--height-loss l1-mse currently requires --dataset us3d')
+    if args.micro_batch_size != args.bs and (args.dataset != 'us3d' or args.height_loss != 'l1-mse'):
+        parser.error('Gradient accumulation currently requires --dataset us3d --height-loss l1-mse')
     args.attention_backend = args.attention_backend or saved_args.get('attention_backend', 'manual')
     if args.sampling_mode is None:
         args.sampling_mode = saved_args.get(
@@ -269,6 +289,8 @@ def main():
             lambda_scale=args.lambda_scale,
             lambda_angle=args.lambda_angle,
         ).to(device)
+    elif args.height_loss == 'l1-mse':
+        criterion = L1MSELoss(mse_weight=args.mse_weight).to(device)
     else:
         criterion = BerHuLoss().to(device)
 
@@ -306,9 +328,14 @@ def main():
             logger.info('Training and validation use whole-image resizing to input size %d', args.img_size)
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
                     args.bs * world_size, args.bs, world_size)
+        logger.info('Microbatch size: %d per GPU; %d microbatches per optimizer step',
+                    args.micro_batch_size, args.bs // args.micro_batch_size)
         logger.info('Optimizer learning rates: %s',
                     {group['name']: group['lr'] for group in optimizer.param_groups})
-        if args.dataset != 'us3dwh':
+        if args.dataset == 'us3d' and args.height_loss == 'l1-mse':
+            logger.info('Height loss: mean(abs(error) + %.6g * error^2), normalized over global valid pixels',
+                        args.mse_weight)
+        elif args.dataset != 'us3dwh':
             logger.info('BerHu uses a shared global threshold and valid-pixel mean across GPUs.')
 
     total_iters = args.epochs * len(trainloader)
@@ -341,26 +368,42 @@ def main():
                 depth = depth.flip(-1)
                 valid_mask = valid_mask.flip(-1)
 
-            outputs = model(img)
             train_mask = (
                 valid_mask.bool() & torch.isfinite(depth)
                 & (depth >= train_min_depth) & (depth <= args.max_depth)
             )
 
             loss_parts = None
-            if args.dataset == 'us3dwh':
-                targets = {
-                    'depth': depth,
-                    'scale': sample['scale'].to(device, non_blocking=True),
-                    'angle': sample['angle'].to(device, non_blocking=True),
-                }
-                loss, loss_parts = criterion(outputs, targets, train_mask, return_components=True)
+            if args.dataset == 'us3d' and args.height_loss == 'l1-mse':
+                global_valid_count = train_mask.sum()
+                if world_size > 1:
+                    dist.all_reduce(global_valid_count, op=dist.ReduceOp.SUM)
+                loss = img.new_zeros(())
+                for start in range(0, img.shape[0], args.micro_batch_size):
+                    end = min(start + args.micro_batch_size, img.shape[0])
+                    context = model.no_sync() if world_size > 1 and end < img.shape[0] else nullcontext()
+                    with context:
+                        outputs = model(img[start:end])
+                        micro_loss = criterion(outputs, depth[start:end], train_mask[start:end], global_valid_count)
+                        if not torch.isfinite(micro_loss):
+                            raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
+                        micro_loss.backward()
+                    loss += micro_loss.detach()
             else:
-                loss = criterion(outputs, depth, train_mask)
+                outputs = model(img)
+                if args.dataset == 'us3dwh':
+                    targets = {
+                        'depth': depth,
+                        'scale': sample['scale'].to(device, non_blocking=True),
+                        'angle': sample['angle'].to(device, non_blocking=True),
+                    }
+                    loss, loss_parts = criterion(outputs, targets, train_mask, return_components=True)
+                else:
+                    loss = criterion(outputs, depth, train_mask)
 
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
-            loss.backward()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
+                loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
 
@@ -393,7 +436,7 @@ def main():
             with torch.no_grad():
                 if args.sampling_mode == 'native':
                     pred = predict_height_tiled(
-                        model.module, img, args.img_size, args.val_tile_overlap, batch_size=args.bs
+                        model.module, img, args.img_size, args.val_tile_overlap, batch_size=args.micro_batch_size
                     )[0]
                 else:
                     outputs = model(img)
