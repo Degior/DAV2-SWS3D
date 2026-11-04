@@ -1,4 +1,5 @@
 import argparse
+import gc
 import logging
 import math
 import os
@@ -236,6 +237,7 @@ def main():
     valloader = DataLoader(
         valset, batch_size=1, pin_memory=True, num_workers=args.num_workers,
         drop_last=False, sampler=valsampler, persistent_workers=args.num_workers > 0,
+        prefetch_factor=1 if args.num_workers > 0 else None,
     )
 
     model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
@@ -291,6 +293,9 @@ def main():
             best_rmse = float(resume_checkpoint.get('best_rmse', math.inf))
         elif rank == 0:
             logger.info('Resetting best RMSE for validation including zero-height targets')
+
+    del resume_checkpoint, saved_args
+    gc.collect()
 
     if rank == 0:
         logger.info('Attention backend: %s', args.attention_backend)
