@@ -138,6 +138,22 @@ def checkpoint_config(checkpoint):
     return config
 
 
+def inference_config(saved_config, tile_size=None, tile_overlap=None):
+    config = saved_config.copy()
+    if tile_size is not None or tile_overlap is not None:
+        if config['sampling_mode'] != 'native':
+            raise ValueError('Tile overrides require a checkpoint with native inference')
+        if tile_size is not None:
+            config['img_size'] = tile_size
+        if tile_overlap is not None:
+            config['val_tile_overlap'] = tile_overlap
+        if config['img_size'] < 14 or config['img_size'] % 14:
+            raise ValueError('Tile size must be a positive multiple of 14')
+        if not 0 <= config['val_tile_overlap'] < config['img_size']:
+            raise ValueError('Tile overlap must be between 0 and tile size - 1')
+    return config
+
+
 @torch.inference_mode()
 def predict(model, image, target_shape, config, tile_batch_size):
     if config['sampling_mode'] == 'native':
@@ -213,6 +229,8 @@ def main():
     parser.add_argument('--val-split', default='dataset/splits/us3d/val_fold5.txt')
     parser.add_argument('--output', required=True)
     parser.add_argument('--tile-batch-size', type=int, default=4)
+    parser.add_argument('--tile-size', type=int, help='Override the native inference tile size without resizing pixels')
+    parser.add_argument('--tile-overlap', type=int, help='Override the native inference overlap in pixels')
     parser.add_argument('--num-workers', type=int, default=2)
     parser.add_argument('--max-images', type=int, default=0)
     parser.add_argument('--worst', type=int, default=6)
@@ -232,11 +250,16 @@ def main():
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    config = checkpoint_config(checkpoint)
+    saved_config = checkpoint_config(checkpoint)
+    try:
+        config = inference_config(saved_config, args.tile_size, args.tile_overlap)
+    except ValueError as error:
+        parser.error(str(error))
     metadata = {'checkpoint': str(Path(args.checkpoint).resolve()),
                 'completed_epochs': int(checkpoint.get('epoch', -1)) + 1,
                 'saved_best_rmse': checkpoint.get('best_rmse'),
                 'val_split': str(Path(args.val_split).resolve()), 'config': config,
+                'checkpoint_config': saved_config,
                 'torch': str(torch.__version__), 'device': str(device),
                 'tile_batch_size': args.tile_batch_size,
                 'averaging': 'mean_per_image matches train.py; pixel_weighted pools pixels separately',
