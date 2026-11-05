@@ -7,6 +7,32 @@ from torchvision.transforms import Compose
 from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop, NativeCrop
 
 
+def read_us3d_split(filelist_path):
+    with open(filelist_path, 'r') as f:
+        records = [
+            line.strip().split(maxsplit=2)
+            for line in f
+            if line.strip() and not line.lstrip().startswith('#')
+        ]
+    invalid = next((record for record in records if len(record) < 2), None)
+    if invalid is not None:
+        raise ValueError(f"Unexpected US3D split record: {invalid}")
+    if not records:
+        raise ValueError(f"US3D split is empty: {filelist_path}")
+    return [record[:2] for record in records]
+
+
+def read_us3d_height(height_path):
+    height = cv2.imread(height_path, cv2.IMREAD_UNCHANGED)
+    if height is None:
+        raise FileNotFoundError(f"Height map not found: {height_path}")
+    if height.ndim != 2:
+        raise ValueError(f"Height map must be single-channel: {height_path}, shape={height.shape}")
+    height = height.astype('float32')
+    height[height == 65535] = np.nan
+    return height * 0.01
+
+
 class US3D(Dataset):
 
     def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize'):
@@ -16,20 +42,8 @@ class US3D(Dataset):
             raise ValueError(f'Unsupported sampling mode: {sampling_mode}')
         self.sampling_mode = sampling_mode
 
-        with open(filelist_path, 'r') as f:
-            lines = f.read().splitlines()
-        records = [
-            line.strip().split(maxsplit=2)
-            for line in lines
-            if line.strip() and not line.lstrip().startswith('#')
-        ]
-        invalid = [record for record in records if len(record) < 2]
-        if invalid:
-            raise ValueError(f"Unexpected US3D split record: {invalid[0]}")
-        if not records:
-            raise ValueError(f"US3D split is empty: {filelist_path}")
         # Baseline mode permanently discards every column after RGB and AGL.
-        self.filelist = [record[:2] for record in records]
+        self.filelist = read_us3d_split(filelist_path)
 
         net_w, net_h = size
         transforms = []
@@ -67,18 +81,12 @@ class US3D(Dataset):
             raise FileNotFoundError(f"Image not found: {image_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) / 255.0
 
-        height_map = cv2.imread(height_path, cv2.IMREAD_UNCHANGED)
-        if height_map is None:
-            raise FileNotFoundError(f"Height map not found: {height_path}")
-        if height_map.ndim != 2 or height_map.shape != image.shape[:2]:
+        height_map = read_us3d_height(height_path)
+        if height_map.shape != image.shape[:2]:
             raise ValueError(
                 f"Height map must be single-channel and match the image: "
                 f"image={image.shape[:2]}, height={height_map.shape}"
             )
-
-        height_map = height_map.astype('float32')
-        height_map[height_map == 65535] = np.nan
-        height_map = height_map * 0.01
 
         # height_map = self.transform_height(height_map)
 

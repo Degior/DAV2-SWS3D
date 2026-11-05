@@ -104,6 +104,58 @@ class L1MSELoss(nn.Module):
         return backward_loss + (global_sum / denominator - backward_loss.detach())
 
 
+class L1AGLLoss(nn.Module):
+    def __init__(self, city_means, agl_weight, sync_distributed=True):
+        super().__init__()
+        if not math.isfinite(agl_weight) or agl_weight < 0:
+            raise ValueError('agl_weight must be finite and nonnegative')
+        self.register_buffer('city_means', torch.as_tensor(city_means, dtype=torch.float32))
+        self.agl_weight = agl_weight
+        self.sync_distributed = sync_distributed
+
+    def _world_size(self):
+        if self.sync_distributed and dist.is_available() and dist.is_initialized():
+            return dist.get_world_size()
+        return 1
+
+    @torch.no_grad()
+    def batch_normalizers(self, target, valid_mask, city_indices):
+        city_means = self.city_means[city_indices, None, None]
+        centered = (target - city_means).masked_fill(~valid_mask, 0)
+        count_per_image = valid_mask.sum(dim=(1, 2))
+        target_sse_per_image = centered.square().sum(dim=(1, 2))
+
+        membership = city_indices[:, None] == torch.arange(self.city_means.numel(), device=target.device)
+        city_counts = (membership * count_per_image[:, None]).sum(dim=0)
+        city_target_sse = (membership * target_sse_per_image[:, None]).sum(dim=0)
+        totals = torch.stack((city_counts.double(), city_target_sse.double()))
+        if self._world_size() > 1:
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+
+        city_counts, city_target_sse = totals.unbind()
+        # A city with zero target variation around its reference mean has no defined R² term.
+        present = (city_counts > 0) & (city_target_sse > 0)
+        city_weights = present / ((city_target_sse + 1e-8) * present.sum().clamp_min(1))
+        return city_counts.sum().clamp_min(1), city_weights
+
+    def forward(self, pred, target, valid_mask, city_indices, normalizers):
+        valid_count, city_weights = normalizers
+        error = (pred - target).masked_fill(~valid_mask, 0)
+        reduction_dtype = torch.float64 if error.dtype == torch.float64 else torch.float32
+        l1 = error.abs().sum(dtype=reduction_dtype) / valid_count.to(reduction_dtype)
+        city_sse_per_image = error.square().sum(dim=(1, 2), dtype=reduction_dtype)
+        agl = (city_sse_per_image * city_weights[city_indices].to(reduction_dtype)).sum()
+        local_loss = l1 + self.agl_weight * agl
+
+        world_size = self._world_size()
+        if world_size == 1:
+            return local_loss
+        global_loss = local_loss.detach().clone()
+        dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
+        backward_loss = local_loss * world_size
+        return backward_loss + (global_loss - backward_loss.detach())
+
+
 def r2_loss(pred, target):
     eps = 1e-8
 

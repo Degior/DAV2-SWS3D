@@ -1,11 +1,14 @@
 import argparse
 import gc
+import json
 import logging
 import math
 import os
 import pprint
 import random
 from contextlib import nullcontext
+from pathlib import Path
+from statistics import harmonic_mean
 
 import numpy as np
 import torch
@@ -20,8 +23,9 @@ from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
 from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
 from depth_anything_v2.dinov2_layers.attention import set_attention_backend
+from prepare_agl_city_stats import us3d_city, validate_agl_city_stats
 from util.dist_helper import setup_distributed
-from util.loss import BerHuLoss, HeightLoss, L1MSELoss
+from util.loss import BerHuLoss, HeightLoss, L1AGLLoss, L1MSELoss
 from util.inference import predict_height_tiled
 from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
@@ -51,10 +55,14 @@ parser.add_argument('--epochs', default=40, type=int)
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--micro-batch-size', type=int,
                     help='Images per forward pass; --bs remains the effective per-GPU optimizer batch')
-parser.add_argument('--height-loss', choices=['berhu', 'l1-mse'],
+parser.add_argument('--height-loss', choices=['berhu', 'l1-mse', 'l1-agl'],
                     help='US3D height loss; fresh/legacy runs use berhu, resume inherits the saved loss')
 parser.add_argument('--mse-weight', type=float,
                     help='Squared-error coefficient for l1-mse (default: 0.05; resume inherits it)')
+parser.add_argument('--agl-city-stats',
+                    help='Training-city statistics JSON from prepare_agl_city_stats.py; resume inherits the data')
+parser.add_argument('--agl-weight', type=float,
+                    help='City-normalized AGL coefficient; defaults to 0.1 times the harmonic mean of city variances')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--lr', default=5e-6, type=float)
 parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
@@ -76,6 +84,8 @@ MODEL_CONFIGS = {
     'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]},
 }
+
+ACCUMULATING_HEIGHT_LOSSES = {'l1-mse', 'l1-agl'}
 
 
 def seed_everything(seed):
@@ -180,9 +190,29 @@ def main():
     if args.bs < 1 or args.micro_batch_size < 1 or args.bs % args.micro_batch_size:
         parser.error('--bs must be positive and divisible by --micro-batch-size')
     if args.dataset != 'us3d' and args.height_loss != 'berhu':
-        parser.error('--height-loss l1-mse currently requires --dataset us3d')
-    if args.micro_batch_size != args.bs and (args.dataset != 'us3d' or args.height_loss != 'l1-mse'):
-        parser.error('Gradient accumulation currently requires --dataset us3d --height-loss l1-mse')
+        parser.error('--height-loss l1-mse and l1-agl require --dataset us3d')
+    if args.micro_batch_size != args.bs and args.height_loss not in ACCUMULATING_HEIGHT_LOSSES:
+        parser.error('Gradient accumulation requires --height-loss l1-mse or l1-agl')
+    if args.height_loss == 'l1-agl':
+        try:
+            if args.agl_city_stats is not None:
+                city_stats = json.loads(Path(args.agl_city_stats).read_text(encoding='utf-8'))
+            else:
+                city_stats = saved_args.get('agl_city_stats')
+            validate_agl_city_stats(city_stats, args.train_split, args.max_depth)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        args.agl_city_stats = city_stats
+        if args.agl_weight is None:
+            args.agl_weight = saved_args.get('agl_weight')
+        if args.agl_weight is None:
+            args.agl_weight = 0.1 * harmonic_mean(
+                stats['variance_m2'] for stats in city_stats['cities'].values()
+            )
+        if not math.isfinite(args.agl_weight) or args.agl_weight < 0:
+            parser.error('--agl-weight must be finite and nonnegative')
+    elif args.agl_city_stats is not None or args.agl_weight is not None:
+        parser.error('--agl-city-stats and --agl-weight require --height-loss l1-agl')
     args.attention_backend = args.attention_backend or saved_args.get('attention_backend', 'manual')
     if args.sampling_mode is None:
         args.sampling_mode = saved_args.get(
@@ -291,6 +321,13 @@ def main():
         ).to(device)
     elif args.height_loss == 'l1-mse':
         criterion = L1MSELoss(mse_weight=args.mse_weight).to(device)
+    elif args.height_loss == 'l1-agl':
+        cities = args.agl_city_stats['cities']
+        city_indices = {city: i for i, city in enumerate(sorted(cities))}
+        criterion = L1AGLLoss(
+            city_means=[cities[city]['mean_m'] for city in city_indices],
+            agl_weight=args.agl_weight,
+        ).to(device)
     else:
         criterion = BerHuLoss().to(device)
 
@@ -307,7 +344,15 @@ def main():
             'sampling_mode': saved_args.get('sampling_mode', 'resize'),
             'img_size': saved_args.get('img_size', 518),
         })
-        if saved_validation_inference != validation_inference:
+        agl_config_changed = args.height_loss == 'l1-agl' and (
+            saved_args.get('height_loss') != args.height_loss
+            or saved_args.get('agl_weight') != args.agl_weight
+            or saved_args.get('agl_city_stats') != args.agl_city_stats
+        )
+        if agl_config_changed:
+            if rank == 0:
+                logger.info('Tracking best RMSE from the first epoch with this AGL configuration')
+        elif saved_validation_inference != validation_inference:
             if rank == 0:
                 logger.info('Resetting best RMSE because validation inference changed: %s -> %s',
                             saved_validation_inference, validation_inference)
@@ -335,6 +380,8 @@ def main():
         if args.dataset == 'us3d' and args.height_loss == 'l1-mse':
             logger.info('Height loss: mean(abs(error) + %.6g * error^2), normalized over global valid pixels',
                         args.mse_weight)
+        elif args.height_loss == 'l1-agl':
+            logger.info('Height loss: global L1 + %.6g * mean(city SSE / city target SSE)', args.agl_weight)
         elif args.dataset != 'us3dwh':
             logger.info('BerHu uses a shared global threshold and valid-pixel mean across GPUs.')
 
@@ -374,17 +421,29 @@ def main():
             )
 
             loss_parts = None
-            if args.dataset == 'us3d' and args.height_loss == 'l1-mse':
-                global_valid_count = train_mask.sum()
-                if world_size > 1:
-                    dist.all_reduce(global_valid_count, op=dist.ReduceOp.SUM)
+            if args.height_loss in ACCUMULATING_HEIGHT_LOSSES:
+                if args.height_loss == 'l1-agl':
+                    batch_cities = torch.tensor(
+                        [city_indices[us3d_city(path)] for path in sample['image_path']], device=device
+                    )
+                    normalizers = criterion.batch_normalizers(depth, train_mask, batch_cities)
+                else:
+                    global_valid_count = train_mask.sum()
+                    if world_size > 1:
+                        dist.all_reduce(global_valid_count, op=dist.ReduceOp.SUM)
                 loss = img.new_zeros(())
                 for start in range(0, img.shape[0], args.micro_batch_size):
-                    end = min(start + args.micro_batch_size, img.shape[0])
+                    end = start + args.micro_batch_size
+                    micro = slice(start, end)
                     context = model.no_sync() if world_size > 1 and end < img.shape[0] else nullcontext()
                     with context:
-                        outputs = model(img[start:end])
-                        micro_loss = criterion(outputs, depth[start:end], train_mask[start:end], global_valid_count)
+                        outputs = model(img[micro])
+                        if args.height_loss == 'l1-agl':
+                            micro_loss = criterion(
+                                outputs, depth[micro], train_mask[micro], batch_cities[micro], normalizers
+                            )
+                        else:
+                            micro_loss = criterion(outputs, depth[micro], train_mask[micro], global_valid_count)
                         if not torch.isfinite(micro_loss):
                             raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
                         micro_loss.backward()
