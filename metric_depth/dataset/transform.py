@@ -249,8 +249,39 @@ class PrepareForNet(object):
 
 
 class NativeCrop:
-    def __init__(self, size):
+    UNIFORM, MID_HEIGHT, TALL, FALLBACK = range(4)
+
+    def __init__(self, size, height_crop_prob=0.0, max_depth=250.0):
         self.height, self.width = size
+        self.height_crop_prob = height_crop_prob
+        self.max_depth = max_depth
+        self.min_target_pixels = max(1, (self.height * self.width + 199) // 200)
+
+    def _sample_target_window(self, mask):
+        target_pixels = np.flatnonzero(mask)
+        if target_pixels.size < self.min_target_pixels:
+            return None
+        max_top = mask.shape[0] - self.height
+        max_left = mask.shape[1] - self.width
+        for _ in range(8):
+            y, x = divmod(target_pixels[np.random.randint(target_pixels.size)], mask.shape[1])
+            top = np.random.randint(max(0, y - self.height + 1), min(y, max_top) + 1)
+            left = np.random.randint(max(0, x - self.width + 1), min(x, max_left) + 1)
+            crop = mask[top:top + self.height, left:left + self.width]
+            if np.count_nonzero(crop) >= self.min_target_pixels:
+                return top, left
+        return None
+
+    def _height_window(self, depth):
+        bands = [(self.MID_HEIGHT, 5.0, 20.0), (self.TALL, 20.0, np.inf)]
+        if np.random.randint(2):
+            bands.reverse()
+        for band, lower, upper in bands:
+            mask = (depth >= lower) & (depth < upper) & (depth <= self.max_depth)
+            window = self._sample_target_window(mask)
+            if window is not None:
+                return window, band
+        return None, self.FALLBACK
 
     def __call__(self, sample):
         height, width = sample['image'].shape[:2]
@@ -265,8 +296,16 @@ class NativeCrop:
                 mode='constant', constant_values=np.nan,
             )
         height, width = sample['image'].shape[:2]
-        top = np.random.randint(0, height - self.height + 1)
-        left = np.random.randint(0, width - self.width + 1)
+        window, band = None, self.UNIFORM
+        if self.height_crop_prob > 0:
+            if np.random.random() < self.height_crop_prob:
+                window, band = self._height_window(sample['depth'])
+            sample['height_crop_band'] = band
+        if window is None:
+            top = np.random.randint(0, height - self.height + 1)
+            left = np.random.randint(0, width - self.width + 1)
+        else:
+            top, left = window
         sample['image'] = sample['image'][top:top + self.height, left:left + self.width]
         sample['depth'] = sample['depth'][top:top + self.height, left:left + self.width]
         return sample

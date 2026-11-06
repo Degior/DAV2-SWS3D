@@ -42,6 +42,8 @@ parser.add_argument('--freeze-backbone', action='store_true')
 parser.add_argument('--img-size', default=518, type=int)
 parser.add_argument('--sampling-mode', choices=['resize', 'native'],
                     help='Fresh US3D training uses native crops; resume inherits the checkpoint mode')
+parser.add_argument('--height-crop-prob', type=float,
+                    help='Probability of targeting objects from 5 m in a native US3D training crop; defaults to 0')
 parser.add_argument('--val-tile-overlap', type=int,
                     help='Native validation tile overlap (default: 126; resume inherits the saved value)')
 parser.add_argument('--min-depth', default=0.1, type=float,
@@ -224,6 +226,12 @@ def main():
         args.sampling_mode = saved_args.get(
             'sampling_mode', 'resize' if resume_checkpoint is not None or args.dataset == 'us3dwh' else 'native'
         )
+    if args.height_crop_prob is None:
+        args.height_crop_prob = saved_args.get('height_crop_prob', 0.0)
+    if not 0.0 <= args.height_crop_prob <= 1.0:
+        parser.error('--height-crop-prob must be between 0 and 1')
+    if args.height_crop_prob and (args.dataset != 'us3d' or args.sampling_mode != 'native'):
+        parser.error('--height-crop-prob requires --dataset us3d --sampling-mode native')
     if args.val_tile_overlap is None:
         args.val_tile_overlap = saved_args.get('val_tile_overlap', 126)
     if args.sampling_mode == 'native':
@@ -278,7 +286,10 @@ def main():
         dataset_class = US3D
         dataset_kwargs['sampling_mode'] = args.sampling_mode
 
-    trainset = dataset_class(args.train_split, 'train', **dataset_kwargs)
+    train_kwargs = dataset_kwargs.copy()
+    if args.height_crop_prob:
+        train_kwargs.update(height_crop_prob=args.height_crop_prob, max_depth=args.max_depth)
+    trainset = dataset_class(args.train_split, 'train', **train_kwargs)
     valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
     trainsampler = torch.utils.data.distributed.DistributedSampler(
         trainset, num_replicas=world_size, rank=rank, shuffle=True
@@ -379,6 +390,9 @@ def main():
         if args.sampling_mode == 'native':
             logger.info('Training: native %dx%d random crops; validation: native tiles with %d px overlap',
                         args.img_size, args.img_size, args.val_tile_overlap)
+            if args.height_crop_prob:
+                logger.info('Height-targeted crop attempts: %.0f%%; fallback uses the same image',
+                            100 * args.height_crop_prob)
         else:
             logger.info('Training and validation use whole-image resizing to input size %d', args.img_size)
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
@@ -404,10 +418,12 @@ def main():
         for group in optimizer.param_groups:
             group['lr'] = lr if group['name'] == 'backbone' else lr * 10.0
 
+    crop_bands = ('uniform', '5-20m', '20m+', 'fallback')
     for epoch in range(start_epoch, args.epochs):
         trainsampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
+        crop_counts = torch.zeros(len(crop_bands), dtype=torch.long) if args.height_crop_prob else None
         train_min_depth = 0.0 if epoch >= args.zero_height_after_epochs else args.min_depth
         if rank == 0:
             logger.info('Epoch %d: training min-depth %.3f m; validation min-depth 0.000 m',
@@ -415,6 +431,8 @@ def main():
             writer.add_scalar('train/min_depth', train_min_depth, epoch * len(trainloader))
 
         for i, sample in enumerate(trainloader):
+            if crop_counts is not None:
+                crop_counts += torch.bincount(sample['height_crop_band'], minlength=len(crop_bands))
             optimizer.zero_grad(set_to_none=True)
             img = sample['image'].to(device, non_blocking=True)
             depth = sample['depth'].to(device, non_blocking=True)
@@ -490,6 +508,16 @@ def main():
                     epoch + 1, args.epochs, i, len(trainloader),
                     optimizer.param_groups[0]['lr'], loss.item(), 100 * train_mask.float().mean().item()
                 )
+
+        if crop_counts is not None:
+            crop_counts = crop_counts.to(device)
+            dist.all_reduce(crop_counts, op=dist.ReduceOp.SUM)
+            if rank == 0:
+                counts = crop_counts.tolist()
+                total = max(sum(counts), 1)
+                summary = ', '.join(f'{band}={count / total:.1%} ({count})'
+                                    for band, count in zip(crop_bands, counts))
+                logger.info('Height crop choices epoch %d: %s', epoch + 1, summary)
 
         model.eval()
         metric_names = list(METRIC_NAMES)

@@ -35,7 +35,8 @@ def read_us3d_height(height_path):
 
 class US3D(Dataset):
 
-    def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize'):
+    def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize',
+                 height_crop_prob=0.0, max_depth=250.0):
         self.mode = mode
         self.size = size
         if sampling_mode not in {'resize', 'native'}:
@@ -58,7 +59,7 @@ class US3D(Dataset):
                 image_interpolation_method=cv2.INTER_CUBIC,
             ))
         elif mode == 'train':
-            transforms.append(NativeCrop((net_h, net_w)))
+            transforms.append(NativeCrop((net_h, net_w), height_crop_prob, max_depth))
         self.transform = Compose(transforms + [
             NormalizeImage(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225]),
