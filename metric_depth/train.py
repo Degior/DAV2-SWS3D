@@ -72,6 +72,8 @@ parser.add_argument('--lambda-scale', default=0.05, type=float)
 parser.add_argument('--lambda-angle', default=0.05, type=float)
 parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--resume', type=str)
+parser.add_argument('--resume-lr', type=float,
+                    help='Override the backbone learning rate on resume while preserving optimizer state')
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--seed', default=42, type=int)
 parser.add_argument('--local-rank', default=0, type=int)
@@ -173,6 +175,10 @@ def main():
     args = parser.parse_args()
     if args.pretrained_from and args.resume:
         parser.error('--pretrained-from and --resume are mutually exclusive')
+    if args.resume_lr is not None:
+        if not args.resume or not math.isfinite(args.resume_lr) or args.resume_lr <= 0:
+            parser.error('--resume-lr requires --resume and a finite positive learning rate')
+        args.lr = args.resume_lr
     if not 0.0 <= args.hflip_prob <= 1.0:
         parser.error('--hflip-prob must be between 0 and 1')
     if args.min_depth < 0 or args.max_depth <= args.min_depth:
@@ -335,7 +341,11 @@ def main():
     best_rmse = math.inf
     if resume_checkpoint is not None:
         if 'optimizer' in resume_checkpoint:
+            configured_lrs = [group['lr'] for group in optimizer.param_groups]
             optimizer.load_state_dict(resume_checkpoint['optimizer'])
+            if args.resume_lr is not None:
+                for group, lr in zip(optimizer.param_groups, configured_lrs):
+                    group['lr'] = lr
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
         saved_validation_min_depth = resume_checkpoint.get(
             'validation_min_depth', saved_args.get('min_depth', 'legacy')
