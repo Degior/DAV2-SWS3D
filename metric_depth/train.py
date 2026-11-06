@@ -44,6 +44,8 @@ parser.add_argument('--sampling-mode', choices=['resize', 'native'],
                     help='Fresh US3D training uses native crops; resume inherits the checkpoint mode')
 parser.add_argument('--height-crop-prob', type=float,
                     help='Probability of targeting objects from 5 m in a native US3D training crop; defaults to 0')
+parser.add_argument('--height-crop-mid-first-prob', type=float,
+                    help='Probability of trying 5-20 m first on a targeted crop; defaults to 0.5')
 parser.add_argument('--val-tile-overlap', type=int,
                     help='Native validation tile overlap (default: 126; resume inherits the saved value)')
 parser.add_argument('--min-depth', default=0.1, type=float,
@@ -228,8 +230,12 @@ def main():
         )
     if args.height_crop_prob is None:
         args.height_crop_prob = saved_args.get('height_crop_prob', 0.0)
+    if args.height_crop_mid_first_prob is None:
+        args.height_crop_mid_first_prob = saved_args.get('height_crop_mid_first_prob', 0.5)
     if not 0.0 <= args.height_crop_prob <= 1.0:
         parser.error('--height-crop-prob must be between 0 and 1')
+    if not 0.0 <= args.height_crop_mid_first_prob <= 1.0:
+        parser.error('--height-crop-mid-first-prob must be between 0 and 1')
     if args.height_crop_prob and (args.dataset != 'us3d' or args.sampling_mode != 'native'):
         parser.error('--height-crop-prob requires --dataset us3d --sampling-mode native')
     if args.val_tile_overlap is None:
@@ -288,7 +294,10 @@ def main():
 
     train_kwargs = dataset_kwargs.copy()
     if args.height_crop_prob:
-        train_kwargs.update(height_crop_prob=args.height_crop_prob, max_depth=args.max_depth)
+        train_kwargs.update(
+            height_crop_prob=args.height_crop_prob, max_depth=args.max_depth,
+            height_crop_mid_first_prob=args.height_crop_mid_first_prob,
+        )
     trainset = dataset_class(args.train_split, 'train', **train_kwargs)
     valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
     trainsampler = torch.utils.data.distributed.DistributedSampler(
@@ -391,8 +400,9 @@ def main():
             logger.info('Training: native %dx%d random crops; validation: native tiles with %d px overlap',
                         args.img_size, args.img_size, args.val_tile_overlap)
             if args.height_crop_prob:
-                logger.info('Height-targeted crop attempts: %.0f%%; fallback uses the same image',
-                            100 * args.height_crop_prob)
+                logger.info('Height-targeted crop attempts: %.0f%%; 5-20 m first: %.0f%% of targeted attempts; '
+                            'fallback uses the same image',
+                            100 * args.height_crop_prob, 100 * args.height_crop_mid_first_prob)
         else:
             logger.info('Training and validation use whole-image resizing to input size %d', args.img_size)
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',

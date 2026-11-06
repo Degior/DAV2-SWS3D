@@ -251,10 +251,11 @@ class PrepareForNet(object):
 class NativeCrop:
     UNIFORM, MID_HEIGHT, TALL, FALLBACK = range(4)
 
-    def __init__(self, size, height_crop_prob=0.0, max_depth=250.0):
+    def __init__(self, size, height_crop_prob=0.0, max_depth=250.0, height_crop_mid_first_prob=0.5):
         self.height, self.width = size
         self.height_crop_prob = height_crop_prob
         self.max_depth = max_depth
+        self.height_crop_mid_first_prob = height_crop_mid_first_prob
         self.min_target_pixels = max(1, (self.height * self.width + 199) // 200)
 
     def _sample_target_window(self, mask):
@@ -274,7 +275,11 @@ class NativeCrop:
 
     def _height_window(self, depth):
         bands = [(self.MID_HEIGHT, 5.0, 20.0), (self.TALL, 20.0, np.inf)]
-        if np.random.randint(2):
+        if self.height_crop_mid_first_prob == 0.5:
+            tall_first = np.random.randint(2)
+        else:
+            tall_first = np.random.random() >= self.height_crop_mid_first_prob
+        if tall_first:
             bands.reverse()
         for band, lower, upper in bands:
             mask = (depth >= lower) & (depth < upper) & (depth <= self.max_depth)
