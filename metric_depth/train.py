@@ -67,6 +67,8 @@ parser.add_argument('--agl-city-stats',
                     help='Training-city statistics JSON from prepare_agl_city_stats.py; resume inherits the data')
 parser.add_argument('--agl-weight', type=float,
                     help='City-normalized AGL coefficient; defaults to 0.1 times the harmonic mean of city variances')
+parser.add_argument('--agl-focal', action=argparse.BooleanOptionalAction,
+                    help='Use focal squared errors in AGL; resume inherits the saved setting')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--lr', default=5e-6, type=float)
 parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
@@ -221,8 +223,10 @@ def main():
             )
         if not math.isfinite(args.agl_weight) or args.agl_weight < 0:
             parser.error('--agl-weight must be finite and nonnegative')
-    elif args.agl_city_stats is not None or args.agl_weight is not None:
-        parser.error('--agl-city-stats and --agl-weight require --height-loss l1-agl')
+        if args.agl_focal is None:
+            args.agl_focal = saved_args.get('agl_focal', False)
+    elif args.agl_city_stats is not None or args.agl_weight is not None or args.agl_focal:
+        parser.error('--agl-city-stats, --agl-weight and --agl-focal require --height-loss l1-agl')
     args.attention_backend = args.attention_backend or saved_args.get('attention_backend', 'manual')
     if args.sampling_mode is None:
         args.sampling_mode = saved_args.get(
@@ -353,6 +357,7 @@ def main():
         criterion = L1AGLLoss(
             city_means=[cities[city]['mean_m'] for city in city_indices],
             agl_weight=args.agl_weight,
+            focal=args.agl_focal,
         ).to(device)
     else:
         criterion = BerHuLoss().to(device)
@@ -377,6 +382,7 @@ def main():
         agl_config_changed = args.height_loss == 'l1-agl' and (
             saved_args.get('height_loss') != args.height_loss
             or saved_args.get('agl_weight') != args.agl_weight
+            or saved_args.get('agl_focal', False) != args.agl_focal
             or saved_args.get('agl_city_stats') != args.agl_city_stats
         )
         if agl_config_changed:
@@ -415,7 +421,10 @@ def main():
             logger.info('Height loss: mean(abs(error) + %.6g * error^2), normalized over global valid pixels',
                         args.mse_weight)
         elif args.height_loss == 'l1-agl':
-            logger.info('Height loss: global L1 + %.6g * mean(city SSE / city target SSE)', args.agl_weight)
+            agl_numerator = 'city focal SSE' if args.agl_focal else 'city SSE'
+            logger.info('Height loss: global L1 + %.6g * mean(%s / city target SSE)', args.agl_weight, agl_numerator)
+            if args.agl_focal:
+                logger.info('AGL focal squared error: error^2 * tanh(0.1 * abs(error))')
         elif args.dataset != 'us3dwh':
             logger.info('BerHu uses a shared global threshold and valid-pixel mean across GPUs.')
 

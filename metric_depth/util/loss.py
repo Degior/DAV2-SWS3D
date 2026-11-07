@@ -105,13 +105,14 @@ class L1MSELoss(nn.Module):
 
 
 class L1AGLLoss(nn.Module):
-    def __init__(self, city_means, agl_weight, sync_distributed=True):
+    def __init__(self, city_means, agl_weight, sync_distributed=True, focal=False):
         super().__init__()
         if not math.isfinite(agl_weight) or agl_weight < 0:
             raise ValueError('agl_weight must be finite and nonnegative')
         self.register_buffer('city_means', torch.as_tensor(city_means, dtype=torch.float32))
         self.agl_weight = agl_weight
         self.sync_distributed = sync_distributed
+        self.focal = focal
 
     def _world_size(self):
         if self.sync_distributed and dist.is_available() and dist.is_initialized():
@@ -142,8 +143,12 @@ class L1AGLLoss(nn.Module):
         valid_count, city_weights = normalizers
         error = (pred - target).masked_fill(~valid_mask, 0)
         reduction_dtype = torch.float64 if error.dtype == torch.float64 else torch.float32
-        l1 = error.abs().sum(dtype=reduction_dtype) / valid_count.to(reduction_dtype)
-        city_sse_per_image = error.square().sum(dim=(1, 2), dtype=reduction_dtype)
+        absolute_error = error.abs()
+        l1 = absolute_error.sum(dtype=reduction_dtype) / valid_count.to(reduction_dtype)
+        squared_error = error.square()
+        if self.focal:
+            squared_error = squared_error * torch.tanh(0.1 * absolute_error)
+        city_sse_per_image = squared_error.sum(dim=(1, 2), dtype=reduction_dtype)
         agl = (city_sse_per_image * city_weights[city_indices].to(reduction_dtype)).sum()
         local_loss = l1 + self.agl_weight * agl
 
