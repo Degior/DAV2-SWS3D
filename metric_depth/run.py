@@ -7,7 +7,7 @@ import matplotlib
 import numpy as np
 import torch
 
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dpt import checkpoint_height_activation, height_model_class
 from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from util.inference import predict_height_tiled, tile_starts
 
@@ -120,8 +120,7 @@ def main():
     if args.max_depth is None:
         args.max_depth = saved_args.get('max_depth', 250.0)
     state = extract_model_state(checkpoint)
-    has_aux_heads = any(key.startswith(('scale_head.', 'angle_head.')) for key in state)
-    model_class = DepthAnythingV2withHeads if has_aux_heads else DepthAnythingV2
+    model_class = height_model_class(state)
     model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
                            'height_activation': args.height_activation})
     set_attention_backend(model, args.attention_backend or saved_args.get('attention_backend', 'manual'))

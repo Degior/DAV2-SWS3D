@@ -51,7 +51,8 @@ class DPTHead(nn.Module):
             use_bn=False,
             out_channels=[256, 512, 1024, 1024],
             use_clstoken=False,
-            height_activation='sigmoid'
+            height_activation='sigmoid',
+            predict_mag=False,
     ):
         super(DPTHead, self).__init__()
 
@@ -124,6 +125,8 @@ class DPTHead(nn.Module):
             nn.Softplus() if height_activation == 'softplus' else nn.Sigmoid()
         )
 
+        self.mag_head = nn.Conv2d(head_features_1 // 2, 1, kernel_size=3, padding=1) if predict_mag else None
+
     def forward(self, out_features, patch_h, patch_w):
         out = []
         for i, x in enumerate(out_features):
@@ -153,14 +156,20 @@ class DPTHead(nn.Module):
         path_2 = self.scratch.refinenet2(path_3, layer_2_rn, size=layer_1_rn.shape[2:])
         path_1 = self.scratch.refinenet1(path_2, layer_1_rn)
 
-        out = self.scratch.output_conv1(path_1)
-        out = F.interpolate(out, (int(patch_h * 14), int(patch_w * 14)), mode="bilinear", align_corners=True)
-        out = self.scratch.output_conv2(out)
+        shared = self.scratch.output_conv1(path_1)
+        size = (patch_h * 14, patch_w * 14)
+        depth_features = F.interpolate(shared, size, mode="bilinear", align_corners=True)
+        depth = self.scratch.output_conv2(depth_features)
+        if self.mag_head is None:
+            return depth
 
-        return out
+        mag = F.interpolate(self.mag_head(shared), size, mode="bilinear", align_corners=True)
+        return depth, F.softplus(mag)
 
 
 class DepthAnythingV2(nn.Module):
+    _predict_mag = False
+
     def __init__(
             self,
             encoder='vitl',
@@ -169,7 +178,7 @@ class DepthAnythingV2(nn.Module):
             use_bn=False,
             use_clstoken=False,
             max_depth=20.0,
-            height_activation='sigmoid'
+            height_activation='sigmoid',
     ):
         super(DepthAnythingV2, self).__init__()
 
@@ -187,25 +196,29 @@ class DepthAnythingV2(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
 
         self.depth_head = DPTHead(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels,
-                                  use_clstoken=use_clstoken, height_activation=height_activation)
+                                  use_clstoken=use_clstoken, height_activation=height_activation,
+                                  predict_mag=self._predict_mag)
+
+    def _encode(self, x):
+        return self.pretrained.get_intermediate_layers(
+            x, self.intermediate_layer_idx[self.encoder], return_class_token=True,
+        )
+
+    def _height(self, depth):
+        if self.height_activation == 'sigmoid':
+            depth = depth * self.max_depth
+        return depth.squeeze(1)
 
     def forward(self, x):
         patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
-
-        features = self.pretrained.get_intermediate_layers(x, self.intermediate_layer_idx[self.encoder],
-                                                           return_class_token=True)
-
-        depth = self.depth_head(features, patch_h, patch_w)
-        if self.height_activation == 'sigmoid':
-            depth = depth * self.max_depth
-
-        return depth.squeeze(1)
+        return self._height(self.depth_head(self._encode(x), patch_h, patch_w))
 
     @torch.no_grad()
     def infer_image(self, raw_image, input_size=518):
         image, (h, w) = self.image2tensor(raw_image, input_size)
 
-        depth = self.forward(image)
+        output = self.forward(image)
+        depth = output['depth'] if isinstance(output, dict) else output
 
         depth = F.interpolate(depth[:, None], (h, w), mode="bilinear", align_corners=True)[0, 0]
 
@@ -318,6 +331,32 @@ class MultiScaleAttnHead(nn.Module):
 
         global_feat = torch.cat(pooled_features, dim=-1)
         return self.fuse(global_feat)
+
+
+class DepthAnythingV2MagScale(DepthAnythingV2):
+    _predict_mag = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.scale_head = MultiScaleAttnHead(
+            embed_dim=self.pretrained.embed_dim,
+            num_layers=len(self.intermediate_layer_idx[self.encoder]),
+        )
+
+    def forward(self, x):
+        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        features = self._encode(x)
+        depth, mag = self.depth_head(features, patch_h, patch_w)
+        scale = F.softplus(self.scale_head(features)).squeeze(1)
+        return {'depth': self._height(depth), 'mag': mag.squeeze(1), 'scale': scale}
+
+
+def height_model_class(state):
+    if 'depth_head.mag_head.weight' in state:
+        return DepthAnythingV2MagScale
+    if any(key.startswith(('scale_head.', 'angle_head.')) for key in state):
+        return DepthAnythingV2withHeads
+    return DepthAnythingV2
 
 
 class DepthAnythingV2withHeads(nn.Module):

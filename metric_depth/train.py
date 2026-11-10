@@ -21,11 +21,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset.us3d import US3D
 from dataset.us3d_with_heads import US3DWH
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dpt import (
+    DepthAnythingV2, DepthAnythingV2MagScale, DepthAnythingV2withHeads, checkpoint_height_activation,
+)
 from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from prepare_agl_city_stats import us3d_city, validate_agl_city_stats
 from util.dist_helper import setup_distributed
-from util.loss import BerHuLoss, HeightLoss, L1AGLLoss, L1MSELoss
+from util.loss import BerHuLoss, HeightLoss, L1AGLLoss, L1AGLMagScaleLoss, L1MSELoss
 from util.inference import predict_height_tiled
 from util.metric import METRIC_NAMES, eval_depth
 from util.utils import depth_to_colormap, init_log
@@ -69,6 +71,8 @@ parser.add_argument('--agl-weight', type=float,
                     help='City-normalized AGL coefficient; defaults to 0.1 times the harmonic mean of city variances')
 parser.add_argument('--agl-focal', action=argparse.BooleanOptionalAction,
                     help='Use focal squared errors in AGL; resume inherits the saved setting')
+parser.add_argument('--mag-scale', action=argparse.BooleanOptionalAction,
+                    help='Train MAG and scale with native US3D crops and l1-agl; resume inherits the setting')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--lr', default=5e-6, type=float)
 parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
@@ -151,12 +155,11 @@ def build_optimizer(model, args):
         'lr': args.lr * 10.0,
         'name': 'depth_head',
     })
-    if args.dataset == 'us3dwh':
-        groups.append({
-            'params': list(model.scale_head.parameters()) + list(model.angle_head.parameters()),
-            'lr': args.lr * 10.0,
-            'name': 'aux_heads',
-        })
+    if args.dataset == 'us3dwh' or args.mag_scale:
+        params = list(model.scale_head.parameters())
+        if args.dataset == 'us3dwh':
+            params.extend(model.angle_head.parameters())
+        groups.append({'params': params, 'lr': args.lr * 10.0, 'name': 'aux_heads'})
 
     optimizer = AdamW(groups, betas=(0.9, 0.999), weight_decay=0.01)
     optimized = {id(param) for group in optimizer.param_groups for param in group['params']}
@@ -193,6 +196,13 @@ def main():
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
     args.height_loss = args.height_loss or saved_args.get('height_loss', 'berhu')
+    saved_mag_scale = saved_args.get('mag_scale', False)
+    if args.mag_scale is None:
+        args.mag_scale = saved_mag_scale
+    elif resume_checkpoint is not None and args.mag_scale != saved_mag_scale:
+        parser.error('--mag-scale must match the resumed checkpoint architecture')
+    if args.mag_scale and (args.dataset != 'us3d' or args.height_loss != 'l1-agl'):
+        parser.error('--mag-scale requires --dataset us3d --height-loss l1-agl')
     if args.mse_weight is None:
         args.mse_weight = saved_args.get('mse_weight', 0.05)
     if args.micro_batch_size is None:
@@ -211,7 +221,7 @@ def main():
                 city_stats = json.loads(Path(args.agl_city_stats).read_text(encoding='utf-8'))
             else:
                 city_stats = saved_args.get('agl_city_stats')
-            validate_agl_city_stats(city_stats, args.train_split, args.max_depth)
+            validate_agl_city_stats(city_stats, args.train_split, args.max_depth, with_mag=args.mag_scale)
         except (OSError, ValueError) as exc:
             parser.error(str(exc))
         args.agl_city_stats = city_stats
@@ -232,6 +242,8 @@ def main():
         args.sampling_mode = saved_args.get(
             'sampling_mode', 'resize' if resume_checkpoint is not None or args.dataset == 'us3dwh' else 'native'
         )
+    if args.mag_scale and args.sampling_mode != 'native':
+        parser.error('--mag-scale requires --sampling-mode native to preserve VFLOW pixel units')
     if args.height_crop_prob is None:
         args.height_crop_prob = saved_args.get('height_crop_prob', 0.0)
     if args.height_crop_mid_first_prob is None:
@@ -294,7 +306,7 @@ def main():
             logger.warning('Horizontal flip is disabled for us3dwh until the angle convention is specified.')
     else:
         dataset_class = US3D
-        dataset_kwargs['sampling_mode'] = args.sampling_mode
+        dataset_kwargs.update(sampling_mode=args.sampling_mode, with_scale=args.mag_scale)
 
     train_kwargs = dataset_kwargs.copy()
     if args.height_crop_prob:
@@ -320,7 +332,11 @@ def main():
         prefetch_factor=1 if args.num_workers > 0 else None,
     )
 
-    model_class = DepthAnythingV2withHeads if args.dataset == 'us3dwh' else DepthAnythingV2
+    model_class = DepthAnythingV2
+    if args.mag_scale:
+        model_class = DepthAnythingV2MagScale
+    elif args.dataset == 'us3dwh':
+        model_class = DepthAnythingV2withHeads
     model = model_class(**{**MODEL_CONFIGS[args.encoder], 'max_depth': args.max_depth,
                            'height_activation': args.height_activation})
     set_attention_backend(model, args.attention_backend)
@@ -354,11 +370,17 @@ def main():
     elif args.height_loss == 'l1-agl':
         cities = args.agl_city_stats['cities']
         city_indices = {city: i for i, city in enumerate(sorted(cities))}
-        criterion = L1AGLLoss(
-            city_means=[cities[city]['mean_m'] for city in city_indices],
-            agl_weight=args.agl_weight,
-            focal=args.agl_focal,
-        ).to(device)
+        loss_kwargs = {
+            'city_means': [cities[city]['mean_m'] for city in city_indices],
+            'agl_weight': args.agl_weight,
+            'focal': args.agl_focal,
+        }
+        if args.mag_scale:
+            criterion = L1AGLMagScaleLoss(
+                **loss_kwargs, mag_city_means=[cities[city]['mag_mean_px'] for city in city_indices],
+            ).to(device)
+        else:
+            criterion = L1AGLLoss(**loss_kwargs).to(device)
     else:
         criterion = BerHuLoss().to(device)
 
@@ -425,6 +447,9 @@ def main():
             logger.info('Height loss: global L1 + %.6g * mean(%s / city target SSE)', args.agl_weight, agl_numerator)
             if args.agl_focal:
                 logger.info('AGL focal squared error: error^2 * tanh(0.1 * abs(error))')
+            if args.mag_scale:
+                logger.info('Auxiliary loss: mean(city MAG SSE / city target MAG SSE) + %.6g * scale MSE',
+                            criterion.scale_weight)
         elif args.dataset != 'us3dwh':
             logger.info('BerHu uses a shared global threshold and valid-pixel mean across GPUs.')
 
@@ -473,7 +498,12 @@ def main():
                     batch_cities = torch.tensor(
                         [city_indices[us3d_city(path)] for path in sample['image_path']], device=device
                     )
-                    normalizers = criterion.batch_normalizers(depth, train_mask, batch_cities)
+                    aux_targets = ()
+                    if args.mag_scale:
+                        scale = sample['scale'].to(device, non_blocking=True)
+                        mag = depth * scale[:, None, None]
+                        aux_targets = (mag, scale)
+                    normalizers = criterion.batch_normalizers(depth, train_mask, batch_cities, *aux_targets)
                 else:
                     global_valid_count = train_mask.sum()
                     if world_size > 1:
@@ -487,7 +517,8 @@ def main():
                         outputs = model(img[micro])
                         if args.height_loss == 'l1-agl':
                             micro_loss = criterion(
-                                outputs, depth[micro], train_mask[micro], batch_cities[micro], normalizers
+                                outputs, depth[micro], train_mask[micro], batch_cities[micro], normalizers,
+                                *(target[micro] for target in aux_targets),
                             )
                         else:
                             micro_loss = criterion(outputs, depth[micro], train_mask[micro], global_valid_count)
@@ -542,6 +573,8 @@ def main():
         metric_names = list(METRIC_NAMES)
         if args.dataset == 'us3dwh':
             metric_names += ['scale_log_mae', 'angle_mae_deg']
+        if args.mag_scale:
+            metric_names += ['mag_rmse_px', 'scale_mae_px_per_m']
         metric_sums = {name: torch.zeros((), device=device) for name in metric_names}
         metric_counts = {name: torch.zeros((), device=device) for name in metric_names}
 
@@ -551,9 +584,11 @@ def main():
             valid_mask = sample['valid_mask'].to(device, non_blocking=True)[0]
             with torch.no_grad():
                 if args.sampling_mode == 'native':
-                    pred = predict_height_tiled(
-                        model.module, img, args.img_size, args.val_tile_overlap, batch_size=args.micro_batch_size
-                    )[0]
+                    tiled = predict_height_tiled(
+                        model.module, img, args.img_size, args.val_tile_overlap,
+                        batch_size=args.micro_batch_size, return_mag_scale=args.mag_scale,
+                    )
+                    pred = (tiled['depth'] if args.mag_scale else tiled)[0]
                 else:
                     outputs = model(img)
                     pred = outputs['depth'] if args.dataset == 'us3dwh' else outputs
@@ -569,6 +604,15 @@ def main():
             for name, value in current.items():
                 metric_sums[name] += value
                 metric_counts[name] += 1
+
+            if args.mag_scale:
+                scale_gt = sample['scale'].to(device)[0]
+                metric_sums['scale_mae_px_per_m'] += (tiled['scale'] - scale_gt).abs()
+                metric_counts['scale_mae_px_per_m'] += 1
+                if eval_mask.any():
+                    mag_error = tiled['mag'][0][eval_mask] - depth[eval_mask] * scale_gt
+                    metric_sums['mag_rmse_px'] += mag_error.square().mean().sqrt()
+                    metric_counts['mag_rmse_px'] += 1
 
             if args.dataset == 'us3dwh':
                 scale_gt = sample['scale'].to(device)

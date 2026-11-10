@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from dataset.us3d import US3D
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dpt import checkpoint_height_activation, height_model_class
 from depth_anything_v2.dinov2_layers.attention import set_attention_backend
 from run import MODEL_CONFIGS, extract_model_state
 from util.inference import predict_height_tiled, tile_starts
@@ -268,7 +268,7 @@ def main():
                 'log_error': 'Positive GT only; prediction clamped to 1e-6, matching train.py',
                 'spatial_groups': 'Native inference: bands near tile edges, outer image border, and remaining pixels'}
     state = extract_model_state(checkpoint)
-    model_class = DepthAnythingV2withHeads if any(k.startswith('scale_head.') for k in state) else DepthAnythingV2
+    model_class = height_model_class(state)
     model = model_class(**MODEL_CONFIGS[config['encoder']], max_depth=config['max_depth'],
                         height_activation=config['height_activation'])
     model.load_state_dict(state, strict=True)

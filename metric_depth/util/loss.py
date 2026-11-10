@@ -119,14 +119,16 @@ class L1AGLLoss(nn.Module):
             return dist.get_world_size()
         return 1
 
-    @torch.no_grad()
     def batch_normalizers(self, target, valid_mask, city_indices):
-        city_means = self.city_means[city_indices, None, None]
-        centered = (target - city_means).masked_fill(~valid_mask, 0)
+        return self._batch_normalizers(target, valid_mask, city_indices, self.city_means)
+
+    @torch.no_grad()
+    def _batch_normalizers(self, target, valid_mask, city_indices, means):
+        centered = (target - means[city_indices, None, None]).masked_fill(~valid_mask, 0)
         count_per_image = valid_mask.sum(dim=(1, 2))
         target_sse_per_image = centered.square().sum(dim=(1, 2))
 
-        membership = city_indices[:, None] == torch.arange(self.city_means.numel(), device=target.device)
+        membership = city_indices[:, None] == torch.arange(means.numel(), device=target.device)
         city_counts = (membership * count_per_image[:, None]).sum(dim=0)
         city_target_sse = (membership * target_sse_per_image[:, None]).sum(dim=0)
         totals = torch.stack((city_counts.double(), city_target_sse.double()))
@@ -140,6 +142,14 @@ class L1AGLLoss(nn.Module):
         return city_counts.sum().clamp_min(1), city_weights
 
     def forward(self, pred, target, valid_mask, city_indices, normalizers):
+        return self._distributed_loss(self._local_loss(pred, target, valid_mask, city_indices, normalizers))
+
+    @staticmethod
+    def _city_squared_error(squared_error, city_indices, city_weights, dtype):
+        per_image = squared_error.sum(dim=(1, 2), dtype=dtype)
+        return (per_image * city_weights[city_indices].to(dtype)).sum()
+
+    def _local_loss(self, pred, target, valid_mask, city_indices, normalizers):
         valid_count, city_weights = normalizers
         error = (pred - target).masked_fill(~valid_mask, 0)
         reduction_dtype = torch.float64 if error.dtype == torch.float64 else torch.float32
@@ -148,10 +158,10 @@ class L1AGLLoss(nn.Module):
         squared_error = error.square()
         if self.focal:
             squared_error = squared_error * torch.tanh(0.1 * absolute_error)
-        city_sse_per_image = squared_error.sum(dim=(1, 2), dtype=reduction_dtype)
-        agl = (city_sse_per_image * city_weights[city_indices].to(reduction_dtype)).sum()
-        local_loss = l1 + self.agl_weight * agl
+        agl = self._city_squared_error(squared_error, city_indices, city_weights, reduction_dtype)
+        return l1 + self.agl_weight * agl
 
+    def _distributed_loss(self, local_loss):
         world_size = self._world_size()
         if world_size == 1:
             return local_loss
@@ -159,6 +169,29 @@ class L1AGLLoss(nn.Module):
         dist.all_reduce(global_loss, op=dist.ReduceOp.SUM)
         backward_loss = local_loss * world_size
         return backward_loss + (global_loss - backward_loss.detach())
+
+
+class L1AGLMagScaleLoss(L1AGLLoss):
+    scale_weight = 20.0
+
+    def __init__(self, city_means, agl_weight, mag_city_means, sync_distributed=True, focal=False):
+        super().__init__(city_means, agl_weight, sync_distributed=sync_distributed, focal=focal)
+        self.register_buffer('mag_city_means', torch.as_tensor(mag_city_means, dtype=torch.float32))
+
+    def batch_normalizers(self, target, valid_mask, city_indices, mag_target, scale_target):
+        agl = super().batch_normalizers(target, valid_mask, city_indices)
+        _, mag_weights = self._batch_normalizers(mag_target, valid_mask, city_indices, self.mag_city_means)
+        # The training sampler and drop_last give all ranks the same batch size.
+        scale_count = scale_target.numel() * self._world_size()
+        return agl, mag_weights, scale_count
+
+    def forward(self, pred, target, valid_mask, city_indices, normalizers, mag_target, scale_target):
+        agl_normalizers, mag_weights, scale_count = normalizers
+        height_loss = self._local_loss(pred['depth'], target, valid_mask, city_indices, agl_normalizers)
+        mag_error = (pred['mag'] - mag_target).masked_fill(~valid_mask, 0)
+        mag_loss = self._city_squared_error(mag_error.square(), city_indices, mag_weights, height_loss.dtype)
+        scale_loss = (pred['scale'] - scale_target).square().sum() / scale_count
+        return self._distributed_loss(height_loss + mag_loss + self.scale_weight * scale_loss)
 
 
 def r2_loss(pred, target):

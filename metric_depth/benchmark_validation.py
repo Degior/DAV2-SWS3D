@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from dataset.us3d import US3D
-from depth_anything_v2.dpt import DepthAnythingV2, DepthAnythingV2withHeads, checkpoint_height_activation
+from depth_anything_v2.dpt import checkpoint_height_activation, height_model_class
 from depth_anything_v2.dinov2_layers.attention import XFORMERS_AVAILABLE, set_attention_backend
 from run import MODEL_CONFIGS, extract_model_state
 from util.inference import predict_height_tiled, tile_starts
@@ -170,7 +170,7 @@ def main():
     state = extract_model_state(checkpoint)
     encoder = args.encoder or saved_args.get('encoder', 'vitl')
     max_depth = saved_args.get('max_depth', 250.0)
-    model_class = DepthAnythingV2withHeads if any(k.startswith('scale_head.') for k in state) else DepthAnythingV2
+    model_class = height_model_class(state)
     model = model_class(**MODEL_CONFIGS[encoder], max_depth=max_depth,
                         height_activation=checkpoint_height_activation(checkpoint))
     model.load_state_dict(state, strict=True)

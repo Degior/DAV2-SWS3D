@@ -1,3 +1,7 @@
+import json
+import math
+from functools import lru_cache
+
 import cv2
 import torch
 import numpy as np
@@ -7,19 +11,32 @@ from torchvision.transforms import Compose
 from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop, NativeCrop
 
 
-def read_us3d_split(filelist_path):
+def read_us3d_split(filelist_path, with_scale=False):
     with open(filelist_path, 'r') as f:
         records = [
             line.strip().split(maxsplit=2)
             for line in f
             if line.strip() and not line.lstrip().startswith('#')
         ]
-    invalid = next((record for record in records if len(record) < 2), None)
+    required_columns = 3 if with_scale else 2
+    invalid = next((record for record in records if len(record) < required_columns), None)
     if invalid is not None:
         raise ValueError(f"Unexpected US3D split record: {invalid}")
     if not records:
         raise ValueError(f"US3D split is empty: {filelist_path}")
-    return [record[:2] for record in records]
+    return [record[:required_columns] for record in records]
+
+
+@lru_cache(maxsize=8192)
+def read_us3d_scale(vflow_path):
+    with open(vflow_path, encoding='utf-8') as file:
+        try:
+            scale = float(json.load(file)['scale']) * 100.0  # pixels/cm to pixels/m
+        except (ValueError, KeyError, TypeError, OverflowError) as exc:
+            raise ValueError(f'Invalid VFLOW scale in {vflow_path}') from exc
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f'VFLOW scale must be finite and positive: {vflow_path}')
+    return scale
 
 
 def read_us3d_height(height_path):
@@ -36,15 +53,18 @@ def read_us3d_height(height_path):
 class US3D(Dataset):
 
     def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize',
-                 height_crop_prob=0.0, max_depth=250.0, height_crop_mid_first_prob=0.5):
+                 height_crop_prob=0.0, max_depth=250.0, height_crop_mid_first_prob=0.5,
+                 with_scale=False):
         self.mode = mode
         self.size = size
         if sampling_mode not in {'resize', 'native'}:
             raise ValueError(f'Unsupported sampling mode: {sampling_mode}')
         self.sampling_mode = sampling_mode
 
-        # Baseline mode permanently discards every column after RGB and AGL.
-        self.filelist = read_us3d_split(filelist_path)
+        if with_scale and sampling_mode != 'native':
+            raise ValueError('VFLOW scale requires native US3D pixels')
+        self.with_scale = with_scale
+        self.filelist = read_us3d_split(filelist_path, with_scale=with_scale)
 
         net_w, net_h = size
         transforms = []
@@ -106,5 +126,7 @@ class US3D(Dataset):
         sample['valid_mask'] = torch.isfinite(sample['depth']) & (sample['depth'] >= 0)
 
         sample['image_path'] = image_path
+        if self.with_scale:
+            sample['scale'] = torch.tensor(read_us3d_scale(rec[2]), dtype=torch.float32)
 
         return sample

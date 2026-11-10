@@ -12,7 +12,7 @@ def tile_starts(length, tile_size, step):
 
 
 @torch.no_grad()
-def predict_height_tiled(model, image, tile_size=518, overlap=126, batch_size=1):
+def predict_height_tiled(model, image, tile_size=518, overlap=126, batch_size=1, *, return_mag_scale=False):
     if image.ndim != 4 or image.shape[0] != 1:
         raise ValueError('Tiled inference expects one NCHW image')
     if tile_size < 14 or tile_size % 14:
@@ -33,8 +33,11 @@ def predict_height_tiled(model, image, tile_size=518, overlap=126, batch_size=1)
         tile_size, periodic=False, device=image.device, dtype=torch.float32
     )
     weights = taper[:, None] * taper[None, :]
-    prediction_sum = torch.zeros((padded_height, padded_width), device=image.device)
-    weight_sum = torch.zeros_like(prediction_sum)
+    channels = 2 if return_mag_scale else 1
+    prediction_sum = torch.zeros((channels, padded_height, padded_width), device=image.device)
+    weight_sum = torch.zeros_like(prediction_sum[0])
+    if return_mag_scale:
+        scale_sum = image.new_zeros((), dtype=torch.float32)
     positions = [(top, left) for top in ys for left in xs]
     for start in range(0, len(positions), batch_size):
         batch_positions = positions[start:start + batch_size]
@@ -44,11 +47,22 @@ def predict_height_tiled(model, image, tile_size=518, overlap=126, batch_size=1)
         ])
         output = model(tiles)
         prediction = output['depth'] if isinstance(output, dict) else output
-        if prediction.shape != (len(batch_positions), tile_size, tile_size):
+        if return_mag_scale:
+            prediction = torch.stack((prediction, output['mag']), dim=1)
+            scale = output['scale']
+            if scale.shape != (len(batch_positions),) or not torch.isfinite(scale).all():
+                raise ValueError('Invalid scale predictions during tiled inference')
+            scale_sum += scale.float().sum()
+        else:
+            prediction = prediction[:, None]
+        if prediction.shape != (len(batch_positions), channels, tile_size, tile_size):
             raise ValueError(f'Unexpected tile prediction shape: {prediction.shape}')
         if not torch.isfinite(prediction).all():
-            raise FloatingPointError('Non-finite height prediction during tiled inference')
+            raise FloatingPointError('Non-finite map prediction during tiled inference')
         for index, (top, left) in enumerate(batch_positions):
-            prediction_sum[top:top + tile_size, left:left + tile_size] += prediction[index].float() * weights
+            prediction_sum[:, top:top + tile_size, left:left + tile_size] += prediction[index].float() * weights
             weight_sum[top:top + tile_size, left:left + tile_size] += weights
-    return (prediction_sum / weight_sum)[:height, :width].unsqueeze(0)
+    result = (prediction_sum / weight_sum)[:, :height, :width]
+    if return_mag_scale:
+        return {'depth': result[:1], 'mag': result[1:], 'scale': scale_sum / len(positions)}
+    return result
