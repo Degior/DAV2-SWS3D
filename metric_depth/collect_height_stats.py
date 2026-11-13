@@ -124,7 +124,7 @@ def checkpoint_config(checkpoint):
     config = {
         'encoder': saved.get('encoder', 'vitl'),
         'sampling_mode': mode,
-        'img_size': saved.get('img_size', 518),
+        'img_size': saved.get('val_img_size', saved.get('img_size', 518)),
         'val_tile_overlap': saved.get('val_tile_overlap', 126),
         'max_depth': saved.get('max_depth', 250.0),
         'height_activation': checkpoint_height_activation(checkpoint),

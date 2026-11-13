@@ -48,6 +48,10 @@ parser.add_argument('--height-crop-prob', type=float,
                     help='Probability of targeting objects from 5 m in a native US3D training crop; defaults to 0')
 parser.add_argument('--height-crop-mid-first-prob', type=float,
                     help='Probability of trying 5-20 m first on a targeted crop; defaults to 0.5')
+parser.add_argument('--val-img-size', type=int,
+                    help='Validation input/tile size; defaults to --img-size, resume inherits the saved value')
+parser.add_argument('--val-tile-batch-size', type=int,
+                    help='Tiles per validation forward pass; defaults to the microbatch size, resume inherits it')
 parser.add_argument('--val-tile-overlap', type=int,
                     help='Native validation tile overlap (default: 126; resume inherits the saved value)')
 parser.add_argument('--min-depth', default=0.1, type=float,
@@ -254,6 +258,14 @@ def main():
         parser.error('--height-crop-mid-first-prob must be between 0 and 1')
     if args.height_crop_prob and (args.dataset != 'us3d' or args.sampling_mode != 'native'):
         parser.error('--height-crop-prob requires --dataset us3d --sampling-mode native')
+    if args.val_img_size is None:
+        args.val_img_size = saved_args.get('val_img_size', args.img_size)
+    if args.val_tile_batch_size is None:
+        args.val_tile_batch_size = saved_args.get('val_tile_batch_size', args.micro_batch_size)
+    if args.val_img_size < 1:
+        parser.error('--val-img-size must be positive')
+    if args.val_tile_batch_size < 1:
+        parser.error('--val-tile-batch-size must be positive')
     if args.val_tile_overlap is None:
         args.val_tile_overlap = saved_args.get('val_tile_overlap', 126)
     if args.sampling_mode == 'native':
@@ -261,9 +273,11 @@ def main():
             parser.error('Native crops currently require --dataset us3d')
         if args.img_size < 14 or args.img_size % 14:
             parser.error('--img-size must be a positive multiple of 14 for native crops')
-        if not 0 <= args.val_tile_overlap < args.img_size:
-            parser.error('--val-tile-overlap must be between 0 and --img-size - 1')
-    validation_inference = {'sampling_mode': args.sampling_mode, 'img_size': args.img_size}
+        if args.val_img_size < 14 or args.val_img_size % 14:
+            parser.error('--val-img-size must be a positive multiple of 14 for native tiles')
+        if not 0 <= args.val_tile_overlap < args.val_img_size:
+            parser.error('--val-tile-overlap must be between 0 and --val-img-size - 1')
+    validation_inference = {'sampling_mode': args.sampling_mode, 'img_size': args.val_img_size}
     if args.sampling_mode == 'native':
         validation_inference['overlap'] = args.val_tile_overlap
     if resume_checkpoint is not None:
@@ -315,7 +329,8 @@ def main():
             height_crop_mid_first_prob=args.height_crop_mid_first_prob,
         )
     trainset = dataset_class(args.train_split, 'train', **train_kwargs)
-    valset = dataset_class(args.val_split, 'val', **dataset_kwargs)
+    val_kwargs = dict(dataset_kwargs, size=(args.val_img_size, args.val_img_size))
+    valset = dataset_class(args.val_split, 'val', **val_kwargs)
     trainsampler = torch.utils.data.distributed.DistributedSampler(
         trainset, num_replicas=world_size, rank=rank, shuffle=True
     )
@@ -425,14 +440,16 @@ def main():
     if rank == 0:
         logger.info('Attention backend: %s', args.attention_backend)
         if args.sampling_mode == 'native':
-            logger.info('Training: native %dx%d random crops; validation: native tiles with %d px overlap',
-                        args.img_size, args.img_size, args.val_tile_overlap)
+            logger.info('Training: native %dx%d random crops; validation: native %dx%d tiles with %d px overlap',
+                        args.img_size, args.img_size, args.val_img_size, args.val_img_size, args.val_tile_overlap)
+            logger.info('Validation tile batch size: %d', args.val_tile_batch_size)
             if args.height_crop_prob:
                 logger.info('Height-targeted crop attempts: %.0f%%; 5-20 m first: %.0f%% of targeted attempts; '
                             'fallback uses the same image',
                             100 * args.height_crop_prob, 100 * args.height_crop_mid_first_prob)
         else:
-            logger.info('Training and validation use whole-image resizing to input size %d', args.img_size)
+            logger.info('Whole-image resizing: training input size %d; validation input size %d',
+                        args.img_size, args.val_img_size)
         logger.info('Global batch size: %d (%d per GPU x %d GPUs)',
                     args.bs * world_size, args.bs, world_size)
         logger.info('Microbatch size: %d per GPU; %d microbatches per optimizer step',
@@ -585,8 +602,8 @@ def main():
             with torch.no_grad():
                 if args.sampling_mode == 'native':
                     tiled = predict_height_tiled(
-                        model.module, img, args.img_size, args.val_tile_overlap,
-                        batch_size=args.micro_batch_size, return_mag_scale=args.mag_scale,
+                        model.module, img, args.val_img_size, args.val_tile_overlap,
+                        batch_size=args.val_tile_batch_size, return_mag_scale=args.mag_scale,
                     )
                     pred = (tiled['depth'] if args.mag_scale else tiled)[0]
                 else:
