@@ -105,7 +105,8 @@ class L1MSELoss(nn.Module):
 
 
 class L1AGLLoss(nn.Module):
-    def __init__(self, city_means, agl_weight, sync_distributed=True, focal=False):
+    def __init__(self, city_means, agl_weight, sync_distributed=True, focal=False,
+                 height_weights=(1.0, 1.0, 1.0)):
         super().__init__()
         if not math.isfinite(agl_weight) or agl_weight < 0:
             raise ValueError('agl_weight must be finite and nonnegative')
@@ -113,6 +114,9 @@ class L1AGLLoss(nn.Module):
         self.agl_weight = agl_weight
         self.sync_distributed = sync_distributed
         self.focal = focal
+        if len(height_weights) != 3 or any(not math.isfinite(w) or w <= 0 for w in height_weights):
+            raise ValueError('height_weights must contain three finite positive values')
+        self.height_weights = tuple(height_weights)
 
     def _world_size(self):
         if self.sync_distributed and dist.is_available() and dist.is_initialized():
@@ -120,10 +124,21 @@ class L1AGLLoss(nn.Module):
         return 1
 
     def batch_normalizers(self, target, valid_mask, city_indices):
-        return self._batch_normalizers(target, valid_mask, city_indices, self.city_means)
+        return self._batch_normalizers(
+            target, valid_mask, city_indices, self.city_means, self._pixel_weights(target, valid_mask),
+        )
+
+    def _pixel_weights(self, target, valid_mask):
+        if self.height_weights == (1.0, 1.0, 1.0):
+            return None
+        low, mid, high = self.height_weights
+        weights = torch.full_like(target, low)
+        weights = torch.where(target >= 5, mid, weights)
+        weights = torch.where(target >= 20, high, weights)
+        return weights.masked_fill(~valid_mask, 0)
 
     @torch.no_grad()
-    def _batch_normalizers(self, target, valid_mask, city_indices, means):
+    def _batch_normalizers(self, target, valid_mask, city_indices, means, pixel_weights=None):
         centered = (target - means[city_indices, None, None]).masked_fill(~valid_mask, 0)
         count_per_image = valid_mask.sum(dim=(1, 2))
         target_sse_per_image = centered.square().sum(dim=(1, 2))
@@ -132,13 +147,19 @@ class L1AGLLoss(nn.Module):
         city_counts = (membership * count_per_image[:, None]).sum(dim=0)
         city_target_sse = (membership * target_sse_per_image[:, None]).sum(dim=0)
         totals = torch.stack((city_counts.double(), city_target_sse.double()))
+        if pixel_weights is not None:
+            per_image_weights = pixel_weights.sum(dim=(1, 2), dtype=torch.float64)
+            city_weight_sums = (membership * per_image_weights[:, None]).sum(dim=0)
+            totals = torch.cat((totals, city_weight_sums[None]))
         if self._world_size() > 1:
             dist.all_reduce(totals, op=dist.ReduceOp.SUM)
 
-        city_counts, city_target_sse = totals.unbind()
+        city_counts, city_target_sse = totals[:2].unbind()
         # A city with zero target variation around its reference mean has no defined R² term.
         present = (city_counts > 0) & (city_target_sse > 0)
         city_weights = present / ((city_target_sse + 1e-8) * present.sum().clamp_min(1))
+        if pixel_weights is not None:
+            city_weights = city_weights * city_counts / totals[2].clamp_min(1e-8)
         return city_counts.sum().clamp_min(1), city_weights
 
     def forward(self, pred, target, valid_mask, city_indices, normalizers):
@@ -158,6 +179,9 @@ class L1AGLLoss(nn.Module):
         squared_error = error.square()
         if self.focal:
             squared_error = squared_error * torch.tanh(0.1 * absolute_error)
+        pixel_weights = self._pixel_weights(target, valid_mask)
+        if pixel_weights is not None:
+            squared_error = squared_error * pixel_weights
         agl = self._city_squared_error(squared_error, city_indices, city_weights, reduction_dtype)
         return l1 + self.agl_weight * agl
 
@@ -174,8 +198,10 @@ class L1AGLLoss(nn.Module):
 class L1AGLMagScaleLoss(L1AGLLoss):
     scale_weight = 20.0
 
-    def __init__(self, city_means, agl_weight, mag_city_means, sync_distributed=True, focal=False):
-        super().__init__(city_means, agl_weight, sync_distributed=sync_distributed, focal=focal)
+    def __init__(self, city_means, agl_weight, mag_city_means, sync_distributed=True, focal=False,
+                 height_weights=(1.0, 1.0, 1.0)):
+        super().__init__(city_means, agl_weight, sync_distributed=sync_distributed,
+                         focal=focal, height_weights=height_weights)
         self.register_buffer('mag_city_means', torch.as_tensor(mag_city_means, dtype=torch.float32))
 
     def batch_normalizers(self, target, valid_mask, city_indices, mag_target, scale_target):

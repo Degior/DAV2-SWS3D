@@ -267,6 +267,9 @@ def main():
                 'height_groups': 'Disjoint GT ranges: zero, (0,0.1), [0.1,1), [1,5), [5,20), [20,max_depth]',
                 'log_error': 'Positive GT only; prediction clamped to 1e-6, matching train.py',
                 'spatial_groups': 'Native inference: bands near tile edges, outer image border, and remaining pixels'}
+    if 'experiment_steps' in checkpoint:
+        for key in ('experiment_steps', 'next_batch', 'validation_epoch'):
+            metadata[key] = checkpoint[key]
     state = extract_model_state(checkpoint)
     model_class = height_model_class(state)
     model = model_class(**MODEL_CONFIGS[config['encoder']], max_depth=config['max_depth'],

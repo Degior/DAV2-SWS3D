@@ -248,6 +248,29 @@ class PrepareForNet(object):
         return sample
 
 
+class NativeAugment:
+    def __init__(self, rotate90=False, photometric_prob=0.0):
+        self.rotate90 = rotate90
+        self.photometric_prob = photometric_prob
+        self.rng = None
+
+    def __call__(self, sample):
+        if self.rng is None:
+            # This stream does not consume the RNG used by NativeCrop.
+            self.rng = np.random.default_rng(torch.initial_seed())
+        if self.rotate90:
+            turns = int(self.rng.integers(4))
+            for key in ('image', 'depth', 'valid_mask', 'mask'):
+                if key in sample:
+                    sample[key] = np.rot90(sample[key], turns, axes=(0, 1)).copy()
+        if self.photometric_prob and self.rng.random() < self.photometric_prob:
+            brightness, contrast = self.rng.uniform(0.9, 1.1, size=2)
+            image = sample['image']
+            mean = image.mean(axis=(0, 1), keepdims=True)
+            sample['image'] = np.clip(((image - mean) * contrast + mean) * brightness, 0, 1)
+        return sample
+
+
 class NativeCrop:
     UNIFORM, MID_HEIGHT, TALL, FALLBACK = range(4)
 

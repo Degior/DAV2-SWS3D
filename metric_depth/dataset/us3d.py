@@ -8,7 +8,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from torchvision.transforms import Compose
 
-from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop, NativeCrop
+from dataset.transform import Resize, NormalizeImage, PrepareForNet, Crop, NativeCrop, NativeAugment
 
 
 def read_us3d_split(filelist_path, with_scale=False):
@@ -54,12 +54,16 @@ class US3D(Dataset):
 
     def __init__(self, filelist_path, mode, size=(518, 518), sampling_mode='resize',
                  height_crop_prob=0.0, max_depth=250.0, height_crop_mid_first_prob=0.5,
-                 with_scale=False):
+                 with_scale=False, rotate90=False, photometric_prob=0.0):
         self.mode = mode
         self.size = size
         if sampling_mode not in {'resize', 'native'}:
             raise ValueError(f'Unsupported sampling mode: {sampling_mode}')
         self.sampling_mode = sampling_mode
+        if not 0 <= photometric_prob <= 1:
+            raise ValueError('photometric_prob must be between 0 and 1')
+        if (rotate90 or photometric_prob) and (sampling_mode != 'native' or mode != 'train'):
+            raise ValueError('Native augmentations require native training crops')
 
         if with_scale and sampling_mode != 'native':
             raise ValueError('VFLOW scale requires native US3D pixels')
@@ -83,6 +87,8 @@ class US3D(Dataset):
                 (net_h, net_w), height_crop_prob=height_crop_prob, max_depth=max_depth,
                 height_crop_mid_first_prob=height_crop_mid_first_prob,
             ))
+        if rotate90 or photometric_prob:
+            transforms.append(NativeAugment(rotate90, photometric_prob))
         self.transform = Compose(transforms + [
             NormalizeImage(mean=[0.485, 0.456, 0.406],
                            std=[0.229, 0.224, 0.225]),

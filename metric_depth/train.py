@@ -6,6 +6,7 @@ import math
 import os
 import pprint
 import random
+import tempfile
 from contextlib import nullcontext
 from pathlib import Path
 from statistics import harmonic_mean
@@ -62,6 +63,9 @@ parser.add_argument('--max-depth', default=250.0, type=float)
 parser.add_argument('--height-activation', choices=['sigmoid', 'softplus'],
                     help='Fresh training defaults to sigmoid; resume uses the checkpoint activation')
 parser.add_argument('--epochs', default=40, type=int)
+parser.add_argument('--train-steps', type=int,
+                    help='Total updates in a step-budgeted experiment; resume restores the experiment counter')
+parser.add_argument('--reset-best', action='store_true', help='Track best validation RMSE within this run')
 parser.add_argument('--bs', default=2, type=int)
 parser.add_argument('--micro-batch-size', type=int,
                     help='Images per forward pass; --bs remains the effective per-GPU optimizer batch')
@@ -75,12 +79,18 @@ parser.add_argument('--agl-weight', type=float,
                     help='City-normalized AGL coefficient; defaults to 0.1 times the harmonic mean of city variances')
 parser.add_argument('--agl-focal', action=argparse.BooleanOptionalAction,
                     help='Use focal squared errors in AGL; resume inherits the saved setting')
+parser.add_argument('--agl-height-weights', nargs=3, type=float, metavar=('LOW', 'MID', 'HIGH'),
+                    help='AGL numerator weights for GT <5, 5-20 and >=20 m, normalized per city; default: 1 1 1')
 parser.add_argument('--mag-scale', action=argparse.BooleanOptionalAction,
                     help='Train MAG and scale with native US3D crops and l1-agl; resume inherits the setting')
 parser.add_argument('--num-workers', default=4, type=int)
 parser.add_argument('--lr', default=5e-6, type=float)
 parser.add_argument('--lr-scheduler', default='constant', choices=['constant', 'poly'])
 parser.add_argument('--hflip-prob', default=0.5, type=float)
+parser.add_argument('--rotate90', action=argparse.BooleanOptionalAction,
+                    help='Random right-angle rotations of native training crops; resume inherits the setting')
+parser.add_argument('--photometric-prob', type=float,
+                    help='Brightness/contrast augmentation probability before RGB normalization; default: 0')
 parser.add_argument('--angle-unit', default='radians', choices=['radians', 'degrees'])
 parser.add_argument('--lambda-scale', default=0.05, type=float)
 parser.add_argument('--lambda-angle', default=0.05, type=float)
@@ -184,6 +194,17 @@ def reduce_metric_dict(metric_sums, metric_counts):
     }
 
 
+def save_checkpoint(checkpoint, destination):
+    destination = Path(destination)
+    with tempfile.NamedTemporaryFile(dir=destination.parent, suffix='.tmp', delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main():
     args = parser.parse_args()
     if args.pretrained_from and args.resume:
@@ -199,6 +220,11 @@ def main():
 
     resume_checkpoint = torch.load(args.resume, map_location='cpu') if args.resume else None
     saved_args = resume_checkpoint.get('args', {}) if resume_checkpoint is not None else {}
+    if args.train_steps is None:
+        args.train_steps = saved_args.get('train_steps')
+    experiment_steps = int(resume_checkpoint.get('experiment_steps', 0)) if resume_checkpoint else 0
+    if args.train_steps is not None and args.train_steps <= experiment_steps:
+        parser.error('--train-steps must exceed the saved experiment step counter')
     args.height_loss = args.height_loss or saved_args.get('height_loss', 'berhu')
     saved_mag_scale = saved_args.get('mag_scale', False)
     if args.mag_scale is None:
@@ -239,8 +265,14 @@ def main():
             parser.error('--agl-weight must be finite and nonnegative')
         if args.agl_focal is None:
             args.agl_focal = saved_args.get('agl_focal', False)
-    elif args.agl_city_stats is not None or args.agl_weight is not None or args.agl_focal:
-        parser.error('--agl-city-stats, --agl-weight and --agl-focal require --height-loss l1-agl')
+        if args.agl_height_weights is None:
+            args.agl_height_weights = saved_args.get('agl_height_weights') or (1.0, 1.0, 1.0)
+        args.agl_height_weights = tuple(args.agl_height_weights)
+        if any(not math.isfinite(w) or w <= 0 for w in args.agl_height_weights):
+            parser.error('--agl-height-weights must be finite and positive')
+    elif (args.agl_city_stats is not None or args.agl_weight is not None
+          or args.agl_focal or args.agl_height_weights is not None):
+        parser.error('AGL parameters require --height-loss l1-agl')
     args.attention_backend = args.attention_backend or saved_args.get('attention_backend', 'manual')
     if args.sampling_mode is None:
         args.sampling_mode = saved_args.get(
@@ -248,6 +280,14 @@ def main():
         )
     if args.mag_scale and args.sampling_mode != 'native':
         parser.error('--mag-scale requires --sampling-mode native to preserve VFLOW pixel units')
+    if args.rotate90 is None:
+        args.rotate90 = saved_args.get('rotate90', False)
+    if args.photometric_prob is None:
+        args.photometric_prob = saved_args.get('photometric_prob', 0.0)
+    if not 0 <= args.photometric_prob <= 1:
+        parser.error('--photometric-prob must be between 0 and 1')
+    if (args.rotate90 or args.photometric_prob) and (args.dataset != 'us3d' or args.sampling_mode != 'native'):
+        parser.error('Native augmentations require --dataset us3d --sampling-mode native')
     if args.height_crop_prob is None:
         args.height_crop_prob = saved_args.get('height_crop_prob', 0.0)
     if args.height_crop_mid_first_prob is None:
@@ -323,6 +363,8 @@ def main():
         dataset_kwargs.update(sampling_mode=args.sampling_mode, with_scale=args.mag_scale)
 
     train_kwargs = dataset_kwargs.copy()
+    if args.dataset == 'us3d':
+        train_kwargs.update(rotate90=args.rotate90, photometric_prob=args.photometric_prob)
     if args.height_crop_prob:
         train_kwargs.update(
             height_crop_prob=args.height_crop_prob, max_depth=args.max_depth,
@@ -346,6 +388,13 @@ def main():
         drop_last=False, sampler=valsampler, persistent_workers=args.num_workers > 0,
         prefetch_factor=1 if args.num_workers > 0 else None,
     )
+    start_batch = int(resume_checkpoint.get('next_batch', 0)) if resume_checkpoint else 0
+    if not 0 <= start_batch < len(trainloader):
+        parser.error('Invalid saved batch position or an empty training loader')
+    if start_batch and (saved_args.get('bs') != args.bs
+                        or resume_checkpoint.get('world_size') != world_size
+                        or resume_checkpoint.get('train_loader_batches') != len(trainloader)):
+        parser.error('Resuming a partial epoch requires the same batch size, GPU count and loader length')
 
     model_class = DepthAnythingV2
     if args.mag_scale:
@@ -389,6 +438,7 @@ def main():
             'city_means': [cities[city]['mean_m'] for city in city_indices],
             'agl_weight': args.agl_weight,
             'focal': args.agl_focal,
+            'height_weights': args.agl_height_weights,
         }
         if args.mag_scale:
             criterion = L1AGLMagScaleLoss(
@@ -420,6 +470,7 @@ def main():
             saved_args.get('height_loss') != args.height_loss
             or saved_args.get('agl_weight') != args.agl_weight
             or saved_args.get('agl_focal', False) != args.agl_focal
+            or tuple(saved_args.get('agl_height_weights') or (1.0, 1.0, 1.0)) != args.agl_height_weights
             or saved_args.get('agl_city_stats') != args.agl_city_stats
         )
         if agl_config_changed:
@@ -434,6 +485,13 @@ def main():
         elif rank == 0:
             logger.info('Resetting best RMSE for validation including zero-height targets')
 
+    available_steps = (args.epochs - start_epoch) * len(trainloader) - start_batch
+    if args.train_steps is not None and available_steps < args.train_steps - experiment_steps:
+        parser.error('--epochs does not allow enough updates for --train-steps')
+    if args.reset_best:
+        best_rmse = math.inf
+        if rank == 0:
+            logger.info('Tracking best RMSE within this run')
     del resume_checkpoint, saved_args
     gc.collect()
 
@@ -456,12 +514,18 @@ def main():
                     args.micro_batch_size, args.bs // args.micro_batch_size)
         logger.info('Optimizer learning rates: %s',
                     {group['name']: group['lr'] for group in optimizer.param_groups})
+        logger.info('Native augmentations: rotate90=%s, photometric probability=%.3f',
+                    args.rotate90, args.photometric_prob)
+        if args.train_steps is not None:
+            logger.info('Experiment optimizer steps: %d / %d', experiment_steps, args.train_steps)
         if args.dataset == 'us3d' and args.height_loss == 'l1-mse':
             logger.info('Height loss: mean(abs(error) + %.6g * error^2), normalized over global valid pixels',
                         args.mse_weight)
         elif args.height_loss == 'l1-agl':
             agl_numerator = 'city focal SSE' if args.agl_focal else 'city SSE'
             logger.info('Height loss: global L1 + %.6g * mean(%s / city target SSE)', args.agl_weight, agl_numerator)
+            logger.info('AGL GT-height weights: %s; normalized to mean 1 per global-batch city',
+                        args.agl_height_weights)
             if args.agl_focal:
                 logger.info('AGL focal squared error: error^2 * tanh(0.1 * abs(error))')
             if args.mag_scale:
@@ -484,6 +548,7 @@ def main():
         trainsampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
+        epoch_batches = 0
         crop_counts = torch.zeros(len(crop_bands), dtype=torch.long) if args.height_crop_prob else None
         train_min_depth = 0.0 if epoch >= args.zero_height_after_epochs else args.min_depth
         if rank == 0:
@@ -492,6 +557,8 @@ def main():
             writer.add_scalar('train/min_depth', train_min_depth, epoch * len(trainloader))
 
         for i, sample in enumerate(trainloader):
+            if i < start_batch:
+                continue
             if crop_counts is not None:
                 crop_counts += torch.bincount(sample['height_crop_band'], minlength=len(crop_bands))
             optimizer.zero_grad(set_to_none=True)
@@ -560,6 +627,8 @@ def main():
                 loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            epoch_batches += 1
+            experiment_steps += 1
 
             iters = epoch * len(trainloader) + i
             update_learning_rate(iters)
@@ -575,6 +644,11 @@ def main():
                     epoch + 1, args.epochs, i, len(trainloader),
                     optimizer.param_groups[0]['lr'], loss.item(), 100 * train_mask.float().mean().item()
                 )
+            if args.train_steps is not None and experiment_steps >= args.train_steps:
+                break
+
+        next_batch = i + 1 if i + 1 < len(trainloader) else 0
+        start_batch = 0
 
         if crop_counts is not None:
             crop_counts = crop_counts.to(device)
@@ -657,29 +731,38 @@ def main():
         averages = reduce_metric_dict(metric_sums, metric_counts)
         if rank == 0:
             logger.info('Validation epoch %d: %s', epoch + 1, pprint.pformat(averages))
-            logger.info('Mean training loss: %.5f', epoch_loss / max(len(trainloader), 1))
+            logger.info('Mean training loss: %.5f', epoch_loss / max(epoch_batches, 1))
+            if args.train_steps is not None:
+                logger.info('Experiment optimizer steps: %d / %d; next batch in current epoch: %d',
+                            experiment_steps, args.train_steps, next_batch)
             for name, value in averages.items():
                 writer.add_scalar(f'eval/{name}', value, epoch)
 
             checkpoint = {
                 'model': model.module.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'epoch': epoch,
+                'epoch': epoch if next_batch == 0 else epoch - 1,
                 'best_rmse': min(best_rmse, averages.get('rmse', math.inf)),
                 'validation_min_depth': None,
                 'validation_inference': validation_inference,
                 'args': vars(args),
             }
-            torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
+            if args.train_steps is not None:
+                checkpoint.update(experiment_steps=experiment_steps, next_batch=next_batch,
+                                  validation_epoch=epoch + 1, world_size=world_size,
+                                  train_loader_batches=len(trainloader))
+            save_checkpoint(checkpoint, os.path.join(args.save_path, 'latest.pth'))
             if averages.get('rmse', math.inf) < best_rmse:
                 best_rmse = averages['rmse']
                 checkpoint['best_rmse'] = best_rmse
-                torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+                save_checkpoint(checkpoint, os.path.join(args.save_path, 'best.pth'))
                 logger.info('New best RMSE: %.4f', best_rmse)
 
         best_tensor = torch.tensor(best_rmse, device=device)
         dist.broadcast(best_tensor, src=0)
         best_rmse = best_tensor.item()
+        if args.train_steps is not None and experiment_steps >= args.train_steps:
+            break
 
     if writer is not None:
         writer.close()
