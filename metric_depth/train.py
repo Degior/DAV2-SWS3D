@@ -98,6 +98,10 @@ parser.add_argument('--pretrained-from', type=str)
 parser.add_argument('--resume', type=str)
 parser.add_argument('--resume-lr', type=float,
                     help='Override the backbone learning rate on resume while preserving optimizer state')
+parser.add_argument('--resume-decoder-lr', type=float,
+                    help='Set the target DPT decoder LR on resume with a constant backbone LR')
+parser.add_argument('--decoder-lr-ramp-steps', type=int,
+                    help='Linearly ramp from the saved DPT decoder LR over this many optimizer updates')
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--seed', default=42, type=int)
 parser.add_argument('--local-rank', default=0, type=int)
@@ -205,6 +209,12 @@ def save_checkpoint(checkpoint, destination):
         temporary.unlink(missing_ok=True)
 
 
+def ramp_learning_rate(start, target, ramp_steps, completed_steps):
+    if ramp_steps <= 1 or completed_steps >= ramp_steps - 1:
+        return target
+    return start + (target - start) * completed_steps / (ramp_steps - 1)
+
+
 def main():
     args = parser.parse_args()
     if args.pretrained_from and args.resume:
@@ -225,6 +235,19 @@ def main():
     experiment_steps = int(resume_checkpoint.get('experiment_steps', 0)) if resume_checkpoint else 0
     if args.train_steps is not None and args.train_steps <= experiment_steps:
         parser.error('--train-steps must exceed the saved experiment step counter')
+    if args.resume_decoder_lr is None:
+        args.resume_decoder_lr = saved_args.get('resume_decoder_lr')
+    if args.decoder_lr_ramp_steps is None:
+        args.decoder_lr_ramp_steps = saved_args.get('decoder_lr_ramp_steps') or 0
+    if args.decoder_lr_ramp_steps < 0 or (args.decoder_lr_ramp_steps and args.resume_decoder_lr is None):
+        parser.error('--decoder-lr-ramp-steps must be nonnegative and requires --resume-decoder-lr')
+    if args.resume_decoder_lr is not None:
+        if not math.isfinite(args.resume_decoder_lr) or args.resume_decoder_lr <= 0:
+            parser.error('--resume-decoder-lr must be finite and positive')
+        if resume_checkpoint is None or 'optimizer' not in resume_checkpoint:
+            parser.error('--resume-decoder-lr requires a checkpoint with an optimizer state')
+        if args.lr_scheduler != 'constant' or args.train_steps is None:
+            parser.error('--resume-decoder-lr requires --lr-scheduler constant and --train-steps')
     args.height_loss = args.height_loss or saved_args.get('height_loss', 'berhu')
     saved_mag_scale = saved_args.get('mag_scale', False)
     if args.mag_scale is None:
@@ -449,6 +472,7 @@ def main():
     else:
         criterion = BerHuLoss().to(device)
 
+    decoder_group = None
     start_epoch = 0
     best_rmse = math.inf
     if resume_checkpoint is not None:
@@ -458,6 +482,20 @@ def main():
             if args.resume_lr is not None:
                 for group, lr in zip(optimizer.param_groups, configured_lrs):
                     group['lr'] = lr
+            if args.resume_decoder_lr is not None:
+                decoder_group = next(group for group in optimizer.param_groups if group['name'] == 'depth_head')
+                same_ramp = (args.resume_decoder_lr == saved_args.get('resume_decoder_lr')
+                             and args.decoder_lr_ramp_steps == saved_args.get('decoder_lr_ramp_steps'))
+                if same_ramp:
+                    args.decoder_lr_start = saved_args['decoder_lr_start']
+                    args.decoder_lr_start_step = saved_args['decoder_lr_start_step']
+                else:
+                    args.decoder_lr_start = decoder_group['lr']
+                    args.decoder_lr_start_step = experiment_steps
+                decoder_group['lr'] = ramp_learning_rate(
+                    args.decoder_lr_start, args.resume_decoder_lr, args.decoder_lr_ramp_steps,
+                    experiment_steps - args.decoder_lr_start_step,
+                )
         start_epoch = int(resume_checkpoint.get('epoch', -1)) + 1
         saved_validation_min_depth = resume_checkpoint.get(
             'validation_min_depth', saved_args.get('min_depth', 'legacy')
@@ -514,6 +552,9 @@ def main():
                     args.micro_batch_size, args.bs // args.micro_batch_size)
         logger.info('Optimizer learning rates: %s',
                     {group['name']: group['lr'] for group in optimizer.param_groups})
+        if decoder_group is not None:
+            logger.info('Decoder LR ramp: %.3e to %.3e over %d optimizer updates',
+                        args.decoder_lr_start, args.resume_decoder_lr, args.decoder_lr_ramp_steps)
         logger.info('Native augmentations: rotate90=%s, photometric probability=%.3f',
                     args.rotate90, args.photometric_prob)
         if args.train_steps is not None:
@@ -625,6 +666,11 @@ def main():
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f'Non-finite loss at epoch {epoch}, iteration {i}')
                 loss.backward()
+            if decoder_group is not None:
+                decoder_group['lr'] = ramp_learning_rate(
+                    args.decoder_lr_start, args.resume_decoder_lr, args.decoder_lr_ramp_steps,
+                    experiment_steps - args.decoder_lr_start_step,
+                )
             optimizer.step()
             epoch_loss += loss.item()
             epoch_batches += 1
@@ -634,6 +680,8 @@ def main():
             update_learning_rate(iters)
             if writer is not None:
                 writer.add_scalar('train/loss', loss.item(), iters)
+                if decoder_group is not None:
+                    writer.add_scalar('train/decoder_lr', decoder_group['lr'], iters)
                 writer.add_scalar('train/valid_fraction', train_mask.float().mean().item(), iters)
                 if loss_parts is not None:
                     for name, value in loss_parts.items():
@@ -644,6 +692,10 @@ def main():
                     epoch + 1, args.epochs, i, len(trainloader),
                     optimizer.param_groups[0]['lr'], loss.item(), 100 * train_mask.float().mean().item()
                 )
+            if rank == 0 and decoder_group is not None:
+                ramp_step = experiment_steps - args.decoder_lr_start_step
+                if ramp_step in (1, args.decoder_lr_ramp_steps):
+                    logger.info('Experiment step %d: decoder LR %.6e', experiment_steps, decoder_group['lr'])
             if args.train_steps is not None and experiment_steps >= args.train_steps:
                 break
 
